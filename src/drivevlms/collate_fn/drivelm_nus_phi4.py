@@ -114,7 +114,7 @@ def drivelm_nus_phi4_collate_fn(examples, processor, dtype):
         inputs = processor([prompt], images=image, return_tensors='pt')
         answer_ids = processor.tokenizer(answer, return_tensors='pt').input_ids
         input_ids = torch.cat([inputs.input_ids, answer_ids], dim=1)
-        labels = copy.deepcopy(input_ids)
+        labels = torch.full_like(input_ids, _IGNORE_INDEX)
         labels[:, -answer_ids.shape[1] :] = answer_ids
 
         if input_ids.size(1) > _MAX_TRAINING_LENGTH:
