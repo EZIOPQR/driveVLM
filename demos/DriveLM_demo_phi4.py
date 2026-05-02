@@ -4,9 +4,6 @@ from transformers import GenerationConfig
 from PIL import Image
 import argparse
 import os
-import cv2
-import numpy as np
-import re
 
 _imgs_filename = [
     "data/DriveLM_nuScenes/nuscenes/samples/CAM_FRONT/n008-2018-09-18-12-07-26-0400__CAM_FRONT__1537287220662404.jpg",
@@ -18,13 +15,15 @@ _imgs_filename = [
 ]
 
 # Load model and processor
-model_path = "/root/autodl-tmp/models/Phi-4-multimodal-instruct"
-processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+processor = AutoProcessor.from_pretrained("/root/autodl-tmp/models/Phi-4-multimodal-instruct",
+                                          trust_remote_code=True)
 
+
+# 官网模型 
 model = AutoModelForCausalLM.from_pretrained(
-    model_path,
-    torch_dtype=torch.float16,
-    _attn_implementation='flash_attention_2',
+    "/root/autodl-tmp/models/Phi-4-multimodal-instruct", 
+    torch_dtype=torch.float16, 
+    _attn_implementation='sdpa',
     trust_remote_code=True
 )
 
@@ -45,7 +44,7 @@ model = AutoModelForCausalLM.from_pretrained(
 model.to('cuda')
 
 # Load generation config
-generation_config = GenerationConfig.from_pretrained(model_path)
+generation_config = GenerationConfig.from_pretrained("/root/autodl-tmp/models/Phi-4-multimodal-instruct")
 
 # Define prompt structure
 user_prompt = '<|user|>'
@@ -73,13 +72,31 @@ def format_prompt(instruction, input=None):
             "Write a response that appropriately completes the request.\n\n"
             "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
         ),
-        "prompt_no_input": (
-            "<|user|><|image_1|><|image_2|><|image_3|><|image_4|><|image_5|><|image_6|>"
-            "Below is an instruction describing a driving perception task, along with six images from different views around the ego vehicle.\n"
-            "Each image corresponds to a specific camera: CAM_FRONT, CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT.\n"
-            "Write a response that appropriately completes the request.\n\n"
-            "### Instruction:\n{instruction}\n\n### Response:<|end|><|assistant|>"
-        )
+        # "prompt_no_input": (
+        #     "<|user|><|image_1|><|image_2|><|image_3|><|image_4|><|image_5|><|image_6|>Below is an instruction that describes a task. "
+        #     "Write a response that appropriately completes the request.\n\n"
+        #     "### Instruction:\n{instruction}\n\n### Response:<|end|><|assistant|>"
+        # ),
+        "prompt_no_input": 
+            ("<|user|><|image_1|><|image_2|><|image_3|><|image_4|><|image_5|><|image_6|>You are an Autonomous Driving AI assistant. You receive an image that consists of six surrounding camera views. These six images are the front view, front left view, front right view, back view, back left view and back right view of the ego vehicle. Your task is to analyze these images and provide insights or actions based on the visual data." + instruction + "<|end|><|assistant|>")
+        # "prompt_no_input": (
+        #     "<|user|><|image_1|><|image_2|><|image_3|><|image_4|><|image_5|><|image_6|>"
+        #     "Below is an instruction describing a driving perception task, along with six images from different views around the ego vehicle.\n"
+        #     "Each image corresponds to a specific camera: CAM_FRONT, CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT.\n"
+        #     "If the instruction refers to important objects in the current scene, please identify all visible objects and annotate them with:\n"
+        #     "- Object ID (e.g., <c1>)\n"
+        #     "- Camera name (e.g., CAM_BACK)\n"
+        #     "- Pixel coordinates of the bounding box center (x, y)\n"
+        #     "- Object type (car, truck, pedestrian, etc.)\n\n"
+        #     "Important:\n"
+        #     "- Be accurate with pixel coordinates (in the format: <id, camera, x_pixel, y_pixel>)\n"
+        #     "- Only include objects visible in the respective image\n"
+        #     "- Do not invent objects not present\n"
+        #     "- Each object should be described once per camera\n\n"
+        #     "Otherwise, feel free to provide a natural language response.\n\n "
+        #     "### Instruction:\n{instruction}\n\n### Response:<|end|><|assistant|>"
+        # )
+        # TODO currently format_prompts support 6 images
     }
     if input is None:
         return PROMPT_DICT['prompt_no_input'].format_map({'instruction': instruction})
@@ -91,53 +108,6 @@ def tokenize(texts, images, processor, device='cuda'):
     return processor(
         text=texts, images=images, return_tensors="pt", padding="longest"
     ).to(device)
-
-
-def visualize(imgs_filename, detection_text, save_path="visualized_output.jpg", model_size=448):
-    if isinstance(detection_text, list):
-        detection_text = detection_text[0]
-    matches = re.findall(r"<([^>]+)>", detection_text)
-    detections = []
-    for match in matches:
-        parts = match.split(",")
-        if len(parts) == 4:
-            obj_id, cam, x, y = parts
-            detections.append({
-                "id": obj_id.strip(),
-                "camera": cam.strip(),
-                "x": float(x),
-                "y": float(y)
-            })
-
-    images = {}
-    for img_path in imgs_filename:
-        img = cv2.imread(img_path)
-        if img is None:
-            continue
-        cam = os.path.basename(img_path).split("__")[1]
-        images[cam] = img
-
-    for det in detections:
-        cam = det["camera"]
-        obj_id = det["id"]
-        if cam in images:
-            img = images[cam]
-            h, w = img.shape[:2]
-            x = int(det["x"] / model_size * w)
-            y = int(det["y"] / model_size * h)
-            cv2.circle(img, (x, y), 8, (0, 255, 0), -1)
-            cv2.putText(img, obj_id, (x+10, y-10), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 2)
-
-    front_order = ["CAM_FRONT_LEFT", "CAM_FRONT", "CAM_FRONT_RIGHT"]
-    back_order  = ["CAM_BACK_LEFT", "CAM_BACK", "CAM_BACK_RIGHT"]
-    target_size = (640, 360)
-
-    row_front = cv2.hconcat([cv2.resize(images[cam], target_size) for cam in front_order])
-    row_back  = cv2.hconcat([cv2.resize(images[cam], target_size) for cam in back_order])
-    combined_image = cv2.vconcat([row_front, row_back])
-
-    cv2.imwrite(save_path, combined_image)
-    print(f"Visualized image saved to: {save_path}")
 
 
 @torch.no_grad()
@@ -154,8 +124,6 @@ def main(args):
         reason_inputs = tokenize([prompt], images, processor, args.device)
         reason_results = infer(reason_inputs)
         print(reason_results)
-
-        visualize(_imgs_filename, reason_results)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DriveLM Phi4 Inference')

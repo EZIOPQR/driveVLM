@@ -1,2 +1,67 @@
+# Datasets & large assets
 data/
+
+# Local / agent tooling
 .claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing & type checking
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML / training runs (adjust if you version small configs)
+wandb/
+lightning_logs/
+runs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+outputs/
+work_dirs/
+
+# Logs & temp
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# IDE (optional: remove .vscode/ if you share workspace settings)
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
