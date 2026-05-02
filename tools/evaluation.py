@@ -28,8 +28,9 @@ class evaluation_suit():
             else:
                 scores.append(0.0)
 
-        scores = sum(scores) / len(scores)
-        return scores
+        if not scores:
+            return None
+        return sum(scores) / len(scores)
 
     # def eval_chatGPT(self, data):
     #     with Pool(32) as p:  # Change the number based on your CPU cores
@@ -45,6 +46,8 @@ class evaluation_suit():
         """
         answer = self.language["answer"]
         GT = self.language["GT"]
+        if not answer:
+            return None
         results_gen = self.language_eval.run_evaluation(answer, GT)
         results_gen_dict = {
             f"val/{k}": v for k, v in results_gen.items()
@@ -58,12 +61,12 @@ class evaluation_suit():
             GT = self.match["match"]["GT"][i]
             _, F1_score = self.match_result(answer, GT)
             outs1.append(F1_score * 100)
-        
-        outs1 = sum(outs1) / len(outs1)
+
+        if not outs1:
+            return None
         # outs2 = self.eval_chatGPT(self.match["GPT"])
         # scores = (outs1 + outs2) / 2.0
-        scores = outs1
-        return scores
+        return sum(outs1) / len(outs1)
 
     def eval_graph(self, question):
         # check if answer in self.graph  
@@ -142,6 +145,11 @@ class evaluation_suit():
             
     def evaluation(self):
         print("evaluation start!")
+        print(
+            f"bucket sizes: accuracy(tag=0)={len(self.accuracy['answer'])}, "
+            f"language(tag=2)={len(self.language['answer'])}, "
+            f"match(tag=3)={len(self.match['match']['answer'])}"
+        )
         scores = {}
         scores["accuracy"] = self.eval_acc()
         # scores["chatgpt"] = self.eval_chatGPT(self.GPT)
@@ -187,29 +195,37 @@ if __name__ == '__main__':
 
     output = evaluation.evaluation()
     print("accuracy score: ", output["accuracy"])
-    print("match score: ", output["match"])
+    print("match score:    ", output["match"])
     print("language score: ", output["language"])
-    
+
     # Normalize to 0-1 and combine the scores: chatgpt, language, match, accuracy
-    scores = []
+    scores = {}
 
     # language
-    score = 0
-    for idx, key in enumerate(output["language"].keys()):
-        if idx < 4:
-            score += output["language"][key] / 4. / 3.
-        elif idx == 4:
-            score += output["language"][key] / 3. 
-        else:
-            score += output["language"][key] / 10. / 3.
+    if output["language"] is not None:
+        score = 0
+        for idx, key in enumerate(output["language"].keys()):
+            if idx < 4:
+                score += output["language"][key] / 4. / 3.
+            elif idx == 4:
+                score += output["language"][key] / 3.
+            else:
+                score += output["language"][key] / 10. / 3.
+        scores["language"] = score
+    else:
+        print("[skip] language bucket is empty (no tag=2 samples).")
 
-    scores.append(score)
-    
     # match
-    score = output["match"] / 100.
-    scores.append(score)
+    if output["match"] is not None:
+        scores["match"] = output["match"] / 100.
+    else:
+        print("[skip] match bucket is empty (no tag=3 samples). "
+              "Likely because --limit was too small to cover prediction QAs.")
 
     # accuracy
-    score = output["accuracy"]
-    scores.append(score)
-    print(f"score:{score}")
+    if output["accuracy"] is not None:
+        scores["accuracy"] = output["accuracy"]
+    else:
+        print("[skip] accuracy bucket is empty (no tag=0 samples).")
+
+    print(f"normalized scores: {scores}")

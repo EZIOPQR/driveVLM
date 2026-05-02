@@ -30,6 +30,10 @@ def main(args):
     collate_fn = build_collate_fn(args.collate_fn)
     val_collate_fn = partial(collate_fn, processor=processor, dtype=torch.bfloat16)
     dataset = load_from_disk(args.data)
+    if args.limit is not None and args.limit > 0:
+        n = min(args.limit, len(dataset))
+        dataset = Subset(dataset, list(range(n)))
+        print(f"[inference] --limit={args.limit} -> running on first {n}/{len(dataset.dataset)} samples")
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -73,6 +77,7 @@ def parse_args():
     parser.add_argument("--output", type=str, default="data/DriveLM_nuScenes/refs/infer_results_21-49.json")
     parser.add_argument("--model", type=str, default="/root/autodl-tmp/models/Phi-4-multimodal-instruct", help="Path to model or checkpoint")
     parser.add_argument("--device", default="cuda", help="Device to run inference")
+    parser.add_argument("--limit", type=int, default=None, help="Only run on the first N samples (useful for smoke test). Default: run full set.")
     args = parser.parse_args()
     return args
 

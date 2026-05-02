@@ -132,14 +132,17 @@ def drivelm_nus_phi4_collate_fn_val(examples, processor, dtype):
     ids = [example["id"] for example in examples]
     questions = [example["conversations"][0]['value'] for example in examples]
     prompts = [format_prompt_phi4(example["conversations"][0]['value']) for example in examples]
-    images = []
+    # Flatten 6 cameras x B samples into a single list of B*6 PIL images, in the order
+    # sample0_cam0..5, sample1_cam0..5, ..., matching the 6 <|image_k|> tokens per prompt.
+    # The Phi-4 processor handles batched left padding internally
+    # (see processing_phi4mm.py, "batched inference requires left padding").
+    flat_images = []
     for example in examples:
-        image = [Image.open(example["image_paths"][i]).convert("RGB") for i in range(6)]
-        images.append(image)
-    # Currently only support batchsize = 1
-    image = [img.resize((448, 448), ) for img in images[0]]
+        for i in range(6):
+            img = Image.open(example["image_paths"][i]).convert("RGB").resize((448, 448))
+            flat_images.append(img)
     tokens = processor(
-        text=prompts, images=image, return_tensors="pt", padding="longest"
+        text=prompts, images=flat_images, return_tensors="pt", padding="longest"
     )
 
     return tokens, questions, ids
