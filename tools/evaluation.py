@@ -183,7 +183,7 @@ if __name__ == '__main__':
             # TODO 
             if idx not in pred_file.keys():
                 break
-            predict = pred_file[idx]["answer"][0]
+            predict = pred_file[idx]["answer"]
             # assert pred_file[idx]["gt_answer"] == GT, print(pred_file[idx]["gt_answer"], GT)
             if first_flag:
                 first_flag = False
