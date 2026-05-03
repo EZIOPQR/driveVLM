@@ -103,7 +103,76 @@ python tools/evaluation.py \
 
 > 已知 latent bug：`evaluation.py` line ~178 的 `pred_file[idx]["answer"][0]` 在 `answer` 是字符串时取的是**首字符**——这会让 BLEU/ROUGE/CIDEr 失真。当前 `inference*.py` 的输出 schema 与之兼容（即同样的旧结果对比），如果以后想拿到真实的 language 指标，需要把这个 `[0]` 拿掉。
 
-## 4. 一条龙
+## 4. `tools/visualize_eval.py` — 离线 HTML 报告（per-sample review）
+
+`evaluation.py` 只给汇总指标。当全集错误样本上千条时，靠分数没法定位"模型到底错在哪"。`visualize_eval.py` 把每条 prediction 渲染成一个卡片，带 6 张相机原图、Q/GT/Pred、单条分数，**离线 HTML，无需起服务**，把单个 .html 拷到本地数据集目录里浏览器打开即可。
+
+**前提**：你的本地机器上需要有 `DriveLM_nuScenes/` 数据集副本，目录结构 `DriveLM_nuScenes/nuscenes/samples/CAM_*/*.jpg`。脚本不生成缩略图，HTML 中 `<img>` 直接指向 `nuscenes/samples/CAM_*/...jpg` 这种相对路径，因此 **HTML 必须放在 `DriveLM_nuScenes/` 这一级目录下**才能解析到图。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--src` | (必填) | 推理结果 JSON |
+| `--gt` | `data/DriveLM_nuScenes/refs/val_cot.json` | GT |
+| `--out` | `viz_eval/` | 输出目录，会写入 `{out}/{src_basename}.html` |
+| `--limit N` | `None` | 只处理前 N 条对齐样本，用于 debug |
+
+示例：
+
+```bash
+# 单个 ckpt
+python tools/visualize_eval.py \
+    --src data/DriveLM_nuScenes/refs/infer_epoch3.json \
+    --out viz_eval/
+
+# 4 个 ckpt 全跑
+for m in baseline epoch1 epoch2 epoch3; do
+  python tools/visualize_eval.py \
+      --src data/DriveLM_nuScenes/refs/infer_${m}.json \
+      --out viz_eval/
+done
+```
+
+输出：
+
+```
+viz_eval/
+├── infer_baseline.html
+├── infer_epoch1.html
+├── infer_epoch2.html
+└── infer_epoch3.html      # 单文件，CSS/JS/数据全内嵌（~10 MB）
+```
+
+本地查看流程：
+
+```bash
+# 1. 把 .html 拷到本地的 DriveLM_nuScenes/ 数据集目录
+scp autodl:/root/DriveVLMs_v3/viz_eval/infer_epoch3.html ~/DriveLM_nuScenes/
+
+# 2. 本地浏览器打开
+open ~/DriveLM_nuScenes/infer_epoch3.html
+```
+
+打分逻辑（与 `evaluation.py` 一致 + 单条扩展）：
+
+| tag | 单条 score | 颜色桶 |
+| --- | --- | --- |
+| 0 (MCQ / 是非) | exact match → 1.0 / 0.0 | 绿 / 红 |
+| 2 (perception 自由生成) | 单句 ROUGE-L F1（LCS） | ≥0.8 绿 / ≥0.3 黄 / 红 |
+| 3 (`<c_i,CAM,x,y>` 坐标) | match-F1（L1<16，逻辑同 `evaluation.py`） | 同上 |
+| 1 (planning) | **跳过**——`evaluation.py` 也没 auto score | — |
+
+HTML 内功能（纯 vanilla JS，不依赖 CDN）：
+
+- **顶部 sticky toolbar**：tag 过滤 / score 过滤 / 关键词搜索（Q+GT+Pred）/ 排序（默认 score 升序，最差先看）/ 分页（50/页）
+- **卡片折叠**：头部一行预览 GT/Pred；点击展开看完整内容 + 6 张相机图 + 标签高亮
+- **`<c1,CAM_FRONT,...>` 标签高亮**：GT 和 Pred 中所有对象引用 tag 都加蓝色 chip
+- **tag=2 diff**：GT 中 Pred 没有的 token 标灰删除线；Pred 中 GT 没有的标黄
+- **tag=3 坐标匹配表**：明确列出 matched / missed (gt 漏的) / extra (pred 多的)，含 L1 距离
+- **图片懒加载**：浏览器只在卡片展开 + 图片进入视口时才请求原图，首次打开秒级响应
+
+性能：脚本只读 JSON 输出 HTML，秒级。单 HTML ~5-15 MB（含 3449 条 records 全 JSON）；浏览器分页只渲染当前页 50 个 DOM 节点。
+
+## 5. 一条龙
 
 ```bash
 python tools/inference_batch.py \
@@ -116,7 +185,7 @@ python tools/evaluation.py \
     --tgt data/DriveLM_nuScenes/refs/val_cot.json
 ```
 
-## 5. 排错速查
+## 6. 排错速查
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
