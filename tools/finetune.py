@@ -82,7 +82,14 @@ def train(args):
     # Build the data collation function, apply the specified processor and dataset
     # and prepare the training dataloader.
     collate_fn = build_collate_fn(config.collate_fn_train)
-    train_collate_fn = partial(collate_fn, processor=processor, dtype=config.dtype)
+    train_collate_fn = partial(
+        collate_fn,
+        processor=processor,
+        dtype=config.dtype,
+        use_optical_flow=getattr(config, "use_optical_flow", False),
+        flow_root=getattr(config, "flow_root", "") or "",
+        flow_scale=getattr(config, "flow_scale", 32.0),
+    )
     dataloader = prepare_training_dataloader(config, train_collate_fn)
 
     num_training_steps = (

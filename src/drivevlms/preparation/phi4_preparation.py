@@ -1,5 +1,6 @@
 
 import torch
+import warnings
 from accelerate import PartialState
 from transformers import (AutoProcessor, 
                         AutoModelForCausalLM, 
@@ -10,6 +11,7 @@ from peft import LoraConfig
 from peft.tuners.lora.layer import LoraLayer
 from drivevlms.models.phi4_bjxx import Phi4MMProcessor, Phi4MMForCausalLM
 from accelerate import Accelerator
+from drivevlms.utils.siglip_expand import expand_siglip_vision_patch_in_channels
 
 @register_prepare_model_and_processor
 def prepare_model_and_processor_phi4(config):
@@ -89,6 +91,11 @@ def prepare_model_and_processor_phi4(config):
     for param in model.model.embed_tokens_extend.image_embed.parameters():
         param.requires_grad = False
 
+    if getattr(config, "use_optical_flow", False):
+        expand_siglip_vision_patch_in_channels(model, 5)
+        for p in model.model.embed_tokens_extend.image_embed.img_processor.embeddings.patch_embedding.parameters():
+            p.requires_grad = True
+
     # Cast trainable (LoRA) params to fp32 so AdamW first/second moments are fp32.
     # bf16 Adam state has only ~7-bit mantissa; sqrt(v_hat) underflows on Ada GPUs and
     # produces NaN updates on the very first step. Base model weights stay bf16.
@@ -133,6 +140,10 @@ def prepare_model_and_processor_phi4_add_lora(config):
 
     # 激活domain
     model.set_lora_adapter('domain')
+    if getattr(config, "use_optical_flow", False):
+        expand_siglip_vision_patch_in_channels(model, 5)
+        for p in model.model.embed_tokens_extend.image_embed.img_processor.embeddings.patch_embedding.parameters():
+            p.requires_grad = True
     return model, processor
 
 
@@ -168,6 +179,11 @@ def prepare_model_and_processor_phi4_merge_vision(config):
         del layer.self_attn.qkv_proj.lora_B.speech
 
     model.set_lora_adapter('vision')
+    if getattr(config, "use_optical_flow", False):
+        expand_siglip_vision_patch_in_channels(model, 5)
+        for p in model.model.embed_tokens_extend.image_embed.img_processor.embeddings.patch_embedding.parameters():
+            p.requires_grad = True
+
     # return model, processor
     def merge_and_remove_lora(model):
         """

@@ -9,6 +9,7 @@ from tqdm import tqdm
 from functools import partial
 import argparse
 from drivevlms.build import build_collate_fn
+from drivevlms.utils.siglip_expand import expand_siglip_vision_patch_in_channels
 import json
 
 @torch.no_grad()
@@ -23,12 +24,21 @@ def main(args):
         _attn_implementation='flash_attention_2',
         trust_remote_code=True
     )
+    if args.use_optical_flow:
+        expand_siglip_vision_patch_in_channels(model, 5)
     model.to(args.device)
     generation_config = GenerationConfig.from_pretrained(base_model)
 
     # prepare dataset
     collate_fn = build_collate_fn(args.collate_fn)
-    val_collate_fn = partial(collate_fn, processor=processor, dtype=torch.bfloat16)
+    val_collate_fn = partial(
+        collate_fn,
+        processor=processor,
+        dtype=torch.bfloat16,
+        use_optical_flow=args.use_optical_flow,
+        flow_root=args.flow_root or "",
+        flow_scale=args.flow_scale,
+    )
     dataset = load_from_disk(args.data)
     if args.limit is not None and args.limit > 0:
         n = min(args.limit, len(dataset))
@@ -78,6 +88,13 @@ def parse_args():
     parser.add_argument("--model", type=str, default="/root/autodl-tmp/models/Phi-4-multimodal-instruct", help="Path to model or checkpoint")
     parser.add_argument("--device", default="cuda", help="Device to run inference")
     parser.add_argument("--limit", type=int, default=None, help="Only run on the first N samples (useful for smoke test). Default: run full set.")
+    parser.add_argument(
+        "--use_optical_flow",
+        action="store_true",
+        help="5-channel SigLIP; requires precomputed .npz under --flow_root.",
+    )
+    parser.add_argument("--flow_root", type=str, default="", help="flow/CAM/*.npz root")
+    parser.add_argument("--flow_scale", type=float, default=32.0)
     args = parser.parse_args()
     return args
 

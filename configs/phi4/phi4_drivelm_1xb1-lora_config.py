@@ -39,4 +39,10 @@ class DriveLMNusPhi4Config:
 
     find_unused_parameters: bool = True
 
+    # Sweep-based optical flow (5-channel SigLIP input). Set True after running
+    # tools/create_data/compute_flow_from_sweeps.py and setting flow_root.
+    use_optical_flow: bool = False
+    flow_root: str = "data/DriveLM_nuScenes/flow"
+    flow_scale: float = 32.0
+
 config = DriveLMNusPhi4Config()

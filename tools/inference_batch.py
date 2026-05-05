@@ -19,6 +19,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
 
 from drivevlms.build import build_collate_fn
+from drivevlms.utils.siglip_expand import expand_siglip_vision_patch_in_channels
 
 
 @torch.no_grad()
@@ -31,12 +32,21 @@ def main(args):
         _attn_implementation='flash_attention_2',
         trust_remote_code=True,
     )
+    if args.use_optical_flow:
+        expand_siglip_vision_patch_in_channels(model, 5)
     model.to(args.device)
     model.eval()
     generation_config = GenerationConfig.from_pretrained(base_model)
 
     collate_fn = build_collate_fn(args.collate_fn)
-    val_collate_fn = partial(collate_fn, processor=processor, dtype=torch.bfloat16)
+    val_collate_fn = partial(
+        collate_fn,
+        processor=processor,
+        dtype=torch.bfloat16,
+        use_optical_flow=args.use_optical_flow,
+        flow_root=args.flow_root or "",
+        flow_scale=args.flow_scale,
+    )
 
     dataset = load_from_disk(args.data)
     total = len(dataset)
@@ -111,6 +121,23 @@ def parse_args():
         help="Only run on the first N samples (for smoke test). Default: full set.",
     )
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument(
+        "--use_optical_flow",
+        action="store_true",
+        help="5-channel SigLIP input; run compute_flow_from_sweeps.py and set --flow-root.",
+    )
+    parser.add_argument(
+        "--flow_root",
+        type=str,
+        default="",
+        help="Root with CAM_*/<jpg_stem>.npz (default: config flow_root when training).",
+    )
+    parser.add_argument(
+        "--flow_scale",
+        type=float,
+        default=32.0,
+        help="Matches training flow_scale (divisor after loading u,v).",
+    )
     return parser.parse_args()
 
 

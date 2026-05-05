@@ -182,11 +182,20 @@ class Phi4MMImageEmbedding(nn.Module):
         LAYER_IDX = self.layer_idx
         TYPE_FEATURE = self.type_feature
         import torchvision
-        p=torchvision.transforms.Normalize(
-            (0.5, 0.5, 0.5),
-            (0.5, 0.5, 0.5)
-        )
-        img_embeds = p(img_embeds)
+        if img_embeds.shape[1] == 5:
+            p3 = torchvision.transforms.Normalize(
+                (0.5, 0.5, 0.5),
+                (0.5, 0.5, 0.5),
+            )
+            rgb = p3(img_embeds[:, :3])
+            flow = img_embeds[:, 3:]
+            img_embeds = torch.cat([rgb, flow], dim=1)
+        else:
+            p = torchvision.transforms.Normalize(
+                (0.5, 0.5, 0.5),
+                (0.5, 0.5, 0.5),
+            )
+            img_embeds = p(img_embeds)
         if self.freeze_img_processor:
             with torch.no_grad():
                 if attention_mask is not None:

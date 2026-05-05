@@ -92,10 +92,41 @@ def cat_with_pad(tensors, dim, padding_value=0):
 
 import torch
 import copy
+from drivevlms.utils.flow_io import load_flow_uv_tensor
+
 _IGNORE_INDEX = -100
 _MAX_TRAINING_LENGTH = 8192
+def _inject_flow_into_image_embeds(
+    input_image_embeds: torch.Tensor,
+    image_paths_for_example: list,
+    flow_root: str,
+    flow_scale: float,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """input_image_embeds: [N_img, 1, 3, H, W] -> [N_img, 1, 5, H, W]."""
+    device = input_image_embeds.device
+    n, _, c, h, w = input_image_embeds.shape
+    if c != 3:
+        return input_image_embeds
+    out = []
+    for i in range(n):
+        rgb = input_image_embeds[i]
+        path = image_paths_for_example[i]
+        uv = load_flow_uv_tensor(path, flow_root, h, w, flow_scale, dtype, device)
+        uv = uv.unsqueeze(0)
+        out.append(torch.cat([rgb, uv], dim=1))
+    return torch.stack(out, dim=0)
+
+
 @register_collate_fn
-def drivelm_nus_phi4_collate_fn(examples, processor, dtype):
+def drivelm_nus_phi4_collate_fn(
+    examples,
+    processor,
+    dtype,
+    use_optical_flow: bool = False,
+    flow_root: str = "",
+    flow_scale: float = 32.0,
+):
     prompts = [format_prompt_phi4(example["conversations"][0]['value']) for example in examples]
     answers = [format_answer(example["conversations"][1]['value']) for example in examples]
     images = []
@@ -112,6 +143,14 @@ def drivelm_nus_phi4_collate_fn(examples, processor, dtype):
     for prompt, answer, image in zip(prompts, answers, images):
         image = [img.resize((448, 448), ) for img in image]
         inputs = processor([prompt], images=image, return_tensors='pt')
+        if use_optical_flow and flow_root:
+            inputs.input_image_embeds = _inject_flow_into_image_embeds(
+                inputs.input_image_embeds,
+                example["image_paths"],
+                flow_root,
+                flow_scale,
+                dtype=torch.float32,
+            )
         answer_ids = processor.tokenizer(answer, return_tensors='pt').input_ids
         input_ids = torch.cat([inputs.input_ids, answer_ids], dim=1)
         labels = torch.full_like(input_ids, _IGNORE_INDEX)
@@ -148,7 +187,14 @@ def drivelm_nus_phi4_collate_fn(examples, processor, dtype):
     )
 
 @register_collate_fn
-def drivelm_nus_phi4_collate_fn_val(examples, processor, dtype):
+def drivelm_nus_phi4_collate_fn_val(
+    examples,
+    processor,
+    dtype,
+    use_optical_flow: bool = False,
+    flow_root: str = "",
+    flow_scale: float = 32.0,
+):
     ids = [example["id"] for example in examples]
     questions = [example["conversations"][0]['value'] for example in examples]
     prompts = [format_prompt_phi4(example["conversations"][0]['value']) for example in examples]
@@ -164,6 +210,20 @@ def drivelm_nus_phi4_collate_fn_val(examples, processor, dtype):
     tokens = processor(
         text=prompts, images=flat_images, return_tensors="pt", padding="longest"
     )
+    if use_optical_flow and flow_root:
+        n_img = tokens.input_image_embeds.shape[0]
+        paths_flat = []
+        for example in examples:
+            for i in range(6):
+                paths_flat.append(example["image_paths"][i])
+        assert len(paths_flat) == n_img, (len(paths_flat), n_img)
+        tokens.input_image_embeds = _inject_flow_into_image_embeds(
+            tokens.input_image_embeds,
+            paths_flat,
+            flow_root,
+            flow_scale,
+            dtype=torch.float32,
+        )
 
     return tokens, questions, ids
 
