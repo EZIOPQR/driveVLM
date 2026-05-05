@@ -15,14 +15,17 @@ Usage:
     data/DriveLM_nuScenes/QA_dataset_nus/v1_1_train_nus.json \\
     --nuscenes-root /path/to/nuscenes \\
     --flow-root data/DriveLM_nuScenes/flow \\
-    --out-size 448
+    --out-size 448 \\
+    --workers 8
 """
 from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +43,10 @@ CAMS = (
 )
 
 US_PER_S = 1_000_000
+
+# POSIX fork: workers inherit these (COW). Windows spawn: set via Pool initializer.
+_PAR_SD_BY_TOKEN: Optional[Dict[str, dict]] = None
+_PAR_KF_INDEX: Optional[Dict[Tuple[str, str], dict]] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +79,12 @@ def parse_args() -> argparse.Namespace:
         "--skip-existing",
         action="store_true",
         help="Skip if target .npz already exists.",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(8, os.cpu_count() or 1)),
+        help="Process pool size (1 = no parallelism). Use about physical CPU cores.",
     )
     return p.parse_args()
 
@@ -231,6 +244,82 @@ def weighted_flow_average(
     return u_out, v_out, True, w_sum
 
 
+def _init_parallel_tables(sd_by_token: Dict[str, dict], kf_index: Dict[Tuple[str, str], dict]) -> None:
+    global _PAR_SD_BY_TOKEN, _PAR_KF_INDEX
+    _PAR_SD_BY_TOKEN = sd_by_token
+    _PAR_KF_INDEX = kf_index
+
+
+def _worker_limit_threads() -> None:
+    try:
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+def _process_one_task(
+    payload: Tuple[str, str, str, str, str, str, int, int],
+) -> str:
+    """One keyframe job. Returns 'ok' | 'fail' | 'exc:…'."""
+    global _PAR_SD_BY_TOKEN, _PAR_KF_INDEX
+    _worker_limit_threads()
+    sample_tok, cam, base, _sub, nusc_s, flow_root_s, out_size, flow_compute_size = payload
+    sd_by_token = _PAR_SD_BY_TOKEN
+    kf_index = _PAR_KF_INDEX
+    if sd_by_token is None or kf_index is None:
+        return "exc:parallel tables not initialized"
+
+    nusc = Path(nusc_s)
+    flow_root = Path(flow_root_s)
+    out_path = flow_root / cam / f"{base}.npz"
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        kf_row = kf_index.get((sample_tok, cam))
+        if kf_row is None:
+            np.savez_compressed(
+                str(out_path),
+                u=np.zeros((out_size, out_size), np.float16),
+                v=np.zeros((out_size, out_size), np.float16),
+                valid=False,
+                reason=b"missing_keyframe_index",
+            )
+            return "fail"
+        t0 = int(kf_row["timestamp"])
+        chain = causal_chain(kf_row, sd_by_token, t0)
+        u, v, valid, w_sum = weighted_flow_average(chain, nusc, flow_compute_size, out_size)
+        np.savez_compressed(
+            str(out_path),
+            u=u.astype(np.float16),
+            v=v.astype(np.float16),
+            valid=valid,
+            w_sum=np.float32(w_sum),
+            n_pairs=len(chain) - 1,
+        )
+        return "ok"
+    except Exception as exc:  # noqa: BLE001
+        return f"exc:{type(exc).__name__}: {exc}"
+
+
+def _collect_pending_tasks(
+    tasks: List[Tuple[str, str, str, str]],
+    flow_root: Path,
+    skip_existing: bool,
+) -> Tuple[List[Tuple[str, str, str, str]], int]:
+    pending: List[Tuple[str, str, str, str]] = []
+    n_skip = 0
+    for sample_tok, cam, base, sub in tasks:
+        out_path = flow_root / cam / f"{base}.npz"
+        if skip_existing and out_path.is_file():
+            n_skip += 1
+            continue
+        pending.append((sample_tok, cam, base, sub))
+    return pending, n_skip
+
+
 def main() -> None:
     args = parse_args()
     nusc = Path(args.nuscenes_root)
@@ -246,41 +335,64 @@ def main() -> None:
     tasks = collect_unique_tasks(drivelm)
     print(f"[info] unique (sample,camera) keyframes: {len(tasks)}")
 
-    n_ok = n_skip = n_fail = 0
-    for sample_tok, cam, base, _sub in tqdm(tasks, desc="flow"):
-        out_path = flow_root / cam / f"{base}.npz"
-        if args.skip_existing and out_path.is_file():
-            n_skip += 1
-            continue
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+    pending, n_skip = _collect_pending_tasks(tasks, flow_root, args.skip_existing)
+    workers = max(1, args.workers)
+    _init_parallel_tables(sd_by_token, kf_index)
 
-        kf_row = kf_index.get((sample_tok, cam))
-        if kf_row is None:
-            np.savez_compressed(
-                str(out_path),
-                u=np.zeros((args.out_size, args.out_size), np.float16),
-                v=np.zeros((args.out_size, args.out_size), np.float16),
-                valid=False,
-                reason=b"missing_keyframe_index",
-            )
-            n_fail += 1
-            continue
-        t0 = int(kf_row["timestamp"])
-        chain = causal_chain(kf_row, sd_by_token, t0)
-        u, v, valid, w_sum = weighted_flow_average(chain, nusc, args.flow_compute_size, args.out_size)
-        np.savez_compressed(
-            str(out_path),
-            u=u.astype(np.float16),
-            v=v.astype(np.float16),
-            valid=valid,
-            w_sum=np.float32(w_sum),
-            n_pairs=len(chain) - 1,
+    n_ok = n_fail = n_exc = 0
+
+    def _run_payloads(payloads: List[Tuple[str, str, str, str, str, str, int, int]]) -> None:
+        nonlocal n_ok, n_fail, n_exc
+        for payload in tqdm(payloads, desc="flow"):
+            res = _process_one_task(payload)
+            if res == "ok":
+                n_ok += 1
+            elif res == "fail":
+                n_fail += 1
+            else:
+                n_exc += 1
+                print(f"[error] {res}", file=sys.stderr)
+
+    payloads = [
+        (
+            sample_tok,
+            cam,
+            base,
+            sub,
+            str(nusc),
+            str(flow_root),
+            args.out_size,
+            args.flow_compute_size,
         )
-        n_ok += 1
+        for sample_tok, cam, base, sub in pending
+    ]
+
+    if workers <= 1 or not payloads:
+        _run_payloads(payloads)
+    else:
+        windows = sys.platform.startswith("win")
+        mp_ctx = multiprocessing.get_context("spawn" if windows else "fork")
+        use_initializer = windows
+        print(f"[info] parallel workers={workers} start_method={mp_ctx.get_start_method()}")
+        ex_kw: Dict[str, Any] = {"max_workers": workers, "mp_context": mp_ctx}
+        if use_initializer:
+            ex_kw["initializer"] = _init_parallel_tables
+            ex_kw["initargs"] = (sd_by_token, kf_index)
+        with ProcessPoolExecutor(**ex_kw) as ex:
+            futures = [ex.submit(_process_one_task, p) for p in payloads]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="flow"):
+                res = fut.result()
+                if res == "ok":
+                    n_ok += 1
+                elif res == "fail":
+                    n_fail += 1
+                else:
+                    n_exc += 1
+                    print(f"[error] {res}", file=sys.stderr)
 
     print(
         f"[done] wrote={n_ok}, skip_existing={n_skip}, missing_index={n_fail}, "
-        f"flow_root={flow_root}"
+        f"errors={n_exc}, flow_root={flow_root}"
     )
 
 
