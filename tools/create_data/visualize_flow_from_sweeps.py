@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Visualize keyframes, all sweep images used for flow, and precomputed flow (.npz).
 
-Flow panel: neutral gray background + subsampled quiver arrows (OpenCV-style: +x right, +y down),
-not a color wheel.
+Flow panel: **HSV color wheel** at **14×14** by default (hue=dir, brightness=|flow|; components scaled when resizing).
 
 Matches ``compute_flow_from_sweeps.py``: for each DriveLM keyframe, the causal chain
 in (t0-1s, t0] (same camera ``prev`` chain) is the set of images averaged pairwise
@@ -26,7 +25,7 @@ from typing import Any, Dict, List, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
+from matplotlib.colors import hsv_to_rgb
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 import numpy as np
 
@@ -68,17 +67,16 @@ def parse_args() -> argparse.Namespace:
         help="Max height in pixels for sweep thumbnails in the top strip.",
     )
     p.add_argument(
-        "--arrow-step",
+        "--hsv-vis-size",
         type=int,
-        default=0,
-        help="Subsample: one arrow every N pixels (0 = auto ~grid/28).",
+        default=14,
+        help="Downsample u/v to this H×W square before HSV encoding (default 14).",
     )
     p.add_argument(
-        "--arrow-scale",
+        "--hsv-mag-percentile",
         type=float,
-        default=0.0,
-        help="Matplotlib quiver scale; larger => shorter arrows. "
-        "0 = auto (recommended). If manual, try 1–5 for ~pixel-scale motion, not 10+.",
+        default=99.0,
+        help="Normalize |flow| brightness by this percentile of magnitude (robust to outliers).",
     )
     p.add_argument(
         "--dpi",
@@ -110,52 +108,33 @@ def resize_max_h(rgb: np.ndarray, max_h: int) -> np.ndarray:
     return cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
 
 
-def draw_flow_quiver(
-    ax: Axes,
-    u: np.ndarray,
-    v: np.ndarray,
-    *,
-    step: int,
-    arrow_scale: float,
-    bg: float = 0.92,
-) -> None:
-    """Draw subsampled flow as small arrows on a neutral background (pixel coords, +y down).
+def flow_uv_to_hsv_rgb(u: np.ndarray, v: np.ndarray, max_mag_percentile: float = 99.0) -> np.ndarray:
+    """Middlebury-style: hue = atan2(v,u), value = |flow| capped at given percentile of magnitude."""
+    u = u.astype(np.float64)
+    v = v.astype(np.float64)
+    mag = np.sqrt(u * u + v * v)
+    ang = np.arctan2(v, u)
+    h = (ang + np.pi) / (2.0 * np.pi)
+    s = np.ones_like(h)
+    cap = float(np.percentile(mag, max_mag_percentile)) + 1e-6
+    vn = np.clip(mag / cap, 0.0, 1.0)
+    hsv = np.stack([h, s, vn], axis=-1)
+    return hsv_to_rgb(hsv)
 
-    Uses ``minlength=0`` so matplotlib does not replace short vectors with microscopic dots
-    (the default ``minlength=1`` together with a large ``scale`` made arrows vanish on export).
-    """
+
+def downsample_uv_for_hsv_vis(u: np.ndarray, v: np.ndarray, g: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Resize u,v to g×g for visualization; scale by grid ratio so vector stays in pixel units of that grid."""
     h, w = u.shape[:2]
-    bg_img = np.full((h, w, 3), bg, dtype=np.float32)
-    ax.imshow(bg_img)
-    if step <= 0:
-        step = max(1, min(h, w) // 28)
-    ys = np.arange(step // 2, h, step)
-    xs = np.arange(step // 2, w, step)
-    if ys.size == 0 or xs.size == 0:
-        return
-    X, Y = np.meshgrid(xs, ys)
-    Uq = u[np.ix_(ys, xs)].astype(np.float64)
-    Vq = v[np.ix_(ys, xs)].astype(np.float64)
-    # scale=None lets matplotlib pick a sensible scale; large fixed scale shrinks arrows to invisibility.
-    scale_kw = {} if arrow_scale <= 0 else {"scale": arrow_scale}
-    ax.quiver(
-        X,
-        Y,
-        Uq,
-        Vq,
-        color="0.06",
-        angles="xy",
-        scale_units="xy",
-        width=0.003,
-        headwidth=3.0,
-        headlength=4.0,
-        headaxislength=3.0,
-        minlength=0,
-        pivot="middle",
-        **scale_kw,
-    )
-    ax.set_xlim(-0.5, w - 0.5)
-    ax.set_ylim(h - 0.5, -0.5)
+    g = max(1, int(g))
+    uf = u.astype(np.float32)
+    vf = v.astype(np.float32)
+    if h == g and w == g:
+        return uf, vf
+    su = g / float(w)
+    sv = g / float(h)
+    u_s = cv2.resize(uf, (g, g), interpolation=cv2.INTER_AREA) * su
+    v_s = cv2.resize(vf, (g, g), interpolation=cv2.INTER_AREA) * sv
+    return u_s, v_s
 
 
 def chain_titles(rows: List[dict], t0: int) -> List[str]:
@@ -321,8 +300,13 @@ def main() -> None:
         ax_kf.axis("off")
 
         ax_fl = fig.add_subplot(bot[0, 1])
-        draw_flow_quiver(ax_fl, u, v, step=args.arrow_step, arrow_scale=args.arrow_scale)
-        ax_fl.set_title("weighted mean optical flow (arrows, +x right, +y down)")
+        g = max(1, args.hsv_vis_size)
+        u_h, v_h = downsample_uv_for_hsv_vis(u, v, g)
+        flow_rgb = flow_uv_to_hsv_rgb(u_h, v_h, max_mag_percentile=args.hsv_mag_percentile)
+        ax_fl.imshow(flow_rgb, interpolation="nearest")
+        ax_fl.set_title(
+            f"optical flow HSV {g}×{g} (hue=dir, bright=|flow|, mag p{args.hsv_mag_percentile:g}%)"
+        )
         ax_fl.axis("off")
 
     if args.save:
