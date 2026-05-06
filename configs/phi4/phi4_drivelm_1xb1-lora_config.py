@@ -50,11 +50,10 @@ class DriveLMNusPhi4Config:
     train_image_projection: bool = False
     train_llm_lora: bool = True
 
-    # Sweep-based optical flow as extra images:
-    # - False: 6 RGB images
-    # - True: 6 RGB + 6 flow images (flow kept at 14x14, not channel-expanded)
+    # Sweep-based optical flow as extra image (CAM_FRONT only):
     use_optical_flow: bool = True
-    flow_root: str = "/root/autodl-tmp/flow"
-    flow_scale: float = 14.0
+    flow_root: str = "/root/autodl-tmp/flow_old"
+    flow_scale_u: float = 8.778
+    flow_scale_v: float = 2.888
 
 config = DriveLMNusPhi4Config()

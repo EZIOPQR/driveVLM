@@ -24,7 +24,6 @@ import numpy as np
 import scipy
 import torch
 import torchvision
-import torch.nn.functional as F
 
 from transformers import AutoFeatureExtractor, AutoImageProcessor
 from transformers.feature_extraction_sequence_utils import SequenceFeatureExtractor
@@ -207,33 +206,13 @@ class Phi4MMImageProcessor(BaseImageProcessor):
             elem, attention_mask = im, torch.ones((dyhd_base_resolution, dyhd_base_resolution))    # new
             elems.append(elem)
             image_attention_masks.append(attention_mask)    # 448*448时 mask全为true
-        hd_images = [img_processor(im).unsqueeze(0).float() for im in elems]
-        shapes = [[im.size(2), im.size(3)] for im in hd_images]
-        max_h = max(s[0] for s in shapes)
-        max_w = max(s[1] for s in shapes)
-        if max_h % 14 != 0:
-            max_h = (max_h // 14 + 1) * 14
-        if max_w % 14 != 0:
-            max_w = (max_w // 14 + 1) * 14
-        # Ensure at least one token after 2x compression path.
-        max_h = max(max_h, 28)
-        max_w = max(max_w, 28)
-
-        image_attention_masks = []
-        padded_images = []
-        for im in hd_images:
-            _, _, h, w = im.shape
-            pad_h = max_h - h
-            pad_w = max_w - w
-            padded = F.pad(im, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
-            padded_images.append(padded)
-            mask_h = max_h // 14
-            mask_w = max_w // 14
-            valid_h = max(1, int(math.ceil(h / 14.0)))
-            valid_w = max(1, int(math.ceil(w / 14.0)))
-            m = torch.zeros((1, mask_h, mask_w), dtype=torch.float32)
-            m[:, :valid_h, :valid_w] = 1.0
-            image_attention_masks.append(m)
+        # hd_images = [img_processor(im) for im in elems]
+        hd_images = [img_processor(im).unsqueeze(0).float() for im in elems]    # new
+        # global_image = [torch.nn.functional.interpolate(im.unsqueeze(0).float(), size=(base_resolution, base_resolution), mode='bicubic',).to(im.dtype) for im in hd_images]
+        # shapes = [[im.size(1), im.size(2)] for im in hd_images]
+        shapes = [[im.size(2), im.size(3)] for im in hd_images] # new
+        # mask_shapes = [[mask.size(0), mask.size(1)] for mask in image_attention_masks]
+        global_attention_mask = [torch.ones((1, mask_resolution, mask_resolution)) for _ in hd_images]
         # 448*448时等于hd_images
         # hd_images_reshape = [im.reshape(1, 3,
         #                                     h//base_resolution,
@@ -256,16 +235,10 @@ class Phi4MMImageProcessor(BaseImageProcessor):
         # downsample_attention_masks = [mask.reshape(mask.size(1)*mask.size(2), mask.size(3)*mask.size(4))for mask in downsample_attention_masks]
         # [1,3,448,448] * 2 -> [2,3,448,448]
 
-        hd_images_reshape = padded_images
-        attention_masks_reshape = image_attention_masks
-        downsample_attention_masks = [mask[:, 0::2, 0::2].squeeze(0) for mask in attention_masks_reshape]
-        num_img_tokens = []
-        for mask in downsample_attention_masks:
-            row_has_any = (mask.sum(dim=1) > 0).sum().item()
-            col_has_any = (mask.sum(dim=0) > 0).sum().item()
-            h_tokens = max(1, int(row_has_any))
-            w_tokens = max(1, int(col_has_any))
-            num_img_tokens.append(h_tokens * (w_tokens + 1))
+        hd_images_reshape = hd_images # new
+        attention_masks_reshape = global_attention_mask # new
+        downsample_attention_masks = [mask[:,0::2,0::2].squeeze(0) for mask in attention_masks_reshape] # new
+        num_img_tokens = [(base_resolution//(14*2))**2+16 for mask in downsample_attention_masks] # new
 
         image_transformed = torch.stack(hd_images_reshape, dim=0) # new
         mask_transformed = torch.stack(attention_masks_reshape, dim=0) # new

@@ -42,7 +42,8 @@ def main(args):
         dtype=torch.bfloat16,
         use_optical_flow=args.use_optical_flow,
         flow_root=args.flow_root or "",
-        flow_scale=args.flow_scale,
+        flow_scale_u=args.flow_scale_u,
+        flow_scale_v=args.flow_scale_v,
     )
 
     dataset = load_from_disk(args.data)
@@ -130,10 +131,16 @@ def parse_args():
         help="Root with CAM_*/<jpg_stem>.npz (default: config flow_root when training).",
     )
     parser.add_argument(
-        "--flow_scale",
+        "--flow_scale_u",
         type=float,
-        default=32.0,
-        help="Matches training flow_scale (divisor after loading u,v).",
+        default=8.778,
+        help="Normalization divisor for flow u channel.",
+    )
+    parser.add_argument(
+        "--flow_scale_v",
+        type=float,
+        default=2.888,
+        help="Normalization divisor for flow v channel.",
     )
     return parser.parse_args()
 

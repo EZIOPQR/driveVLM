@@ -2,6 +2,7 @@ from transformers import BatchFeature
 from ..registry import register_collate_fn
 from PIL import Image
 import os
+import cv2
 import numpy as np
 from drivevlms.utils.flow_io import flow_npz_path_for_image
 
@@ -42,19 +43,17 @@ def format_prompt_phi4(instruction, input=None, include_flow_images: bool = Fals
         ),
         "prompt_no_input_with_flow": (
             "<|user|><|image_1|><|image_2|><|image_3|><|image_4|><|image_5|><|image_6|>"
-            "<|image_7|><|image_8|><|image_9|><|image_10|><|image_11|><|image_12|>"
-            "You are an autonomous-driving perception assistant. The twelve images above are ordered as: "
-            "first six RGB surround-view camera images, then six optical-flow images aligned one-to-one by camera order.\n\n"
+            "<|image_7|>"
+            "You are an autonomous-driving perception assistant. The first six images are the ego vehicle's surround-view cameras. "
+            "The seventh image is the optical-flow visualization of CAM_FRONT.\n\n"
             "## Camera order\n"
-            "The 6 camera slots are provided in this fixed order:\n"
+            "The 6 RGB images are provided in this fixed order:\n"
             "1. `CAM_FRONT`\n"
             "2. `CAM_FRONT_LEFT`\n"
             "3. `CAM_FRONT_RIGHT`\n"
             "4. `CAM_BACK`\n"
             "5. `CAM_BACK_LEFT`\n"
             "6. `CAM_BACK_RIGHT`\n\n"
-            "RGB images are image_1 to image_6. "
-            "Flow images are image_7 to image_12, in the same camera order.\n\n"
             "## Object reference tag format\n"
             "Whenever an object is referenced — **both when you read the question and when you write the answer** — use exactly this tag:\n\n"
             "`<c{{ID}},{{CAMERA}},{{X}},{{Y}}>`\n\n"
@@ -132,31 +131,40 @@ _MAX_TRAINING_LENGTH = 8192
 def _flow_rgb_image_for_path(
     image_path: str,
     flow_root: str,
-    flow_scale: float,
-    flow_hw: int = 14,
+    flow_scale_u: float,
+    flow_scale_v: float,
 ) -> Image.Image:
-    """Load CAM/*.npz flow and pack normalized (u,v) into a 14x14 RGB image."""
-    if float(flow_scale) == 0.0:
-        raise ValueError("flow_scale must be non-zero")
+    """Load CAM/*.npz flow, visualize as HSV (angle→H, magnitude→S, V=255), resize to 448x448."""
+    if float(flow_scale_u) == 0.0 or float(flow_scale_v) == 0.0:
+        raise ValueError("flow_scale_u and flow_scale_v must be non-zero")
     flow_path = flow_npz_path_for_image(image_path, flow_root)
-    u = np.zeros((flow_hw, flow_hw), dtype=np.float32)
-    v = np.zeros((flow_hw, flow_hw), dtype=np.float32)
     if flow_root and os.path.isfile(flow_path):
         z = np.load(flow_path)
         raw_valid = z.get("valid", np.array(True))
         valid = bool(raw_valid.item()) if isinstance(raw_valid, np.ndarray) and raw_valid.size else bool(raw_valid)
         if valid:
-            u_raw = np.asarray(z["u"], dtype=np.float32)
-            v_raw = np.asarray(z["v"], dtype=np.float32)
-            if u_raw.shape == (flow_hw, flow_hw) and v_raw.shape == (flow_hw, flow_hw):
-                u = u_raw
-                v = v_raw
-    u = np.clip(u / float(flow_scale), -1.0, 1.0)
-    v = np.clip(v / float(flow_scale), -1.0, 1.0)
-    rgb = np.zeros((flow_hw, flow_hw, 3), dtype=np.uint8)
-    rgb[..., 0] = ((u + 1.0) * 127.5).astype(np.uint8)
-    rgb[..., 1] = ((v + 1.0) * 127.5).astype(np.uint8)
-    return Image.fromarray(rgb, mode="RGB")
+            u = np.asarray(z["u"], dtype=np.float32)
+            v = np.asarray(z["v"], dtype=np.float32)
+        else:
+            u = np.zeros_like(np.asarray(z["u"], dtype=np.float32))
+            v = np.zeros_like(u)
+    else:
+        u = np.zeros((448, 448), dtype=np.float32)
+        v = np.zeros((448, 448), dtype=np.float32)
+    flow_hw = u.shape[0]
+    u = u / float(flow_scale_u)
+    v = v / float(flow_scale_v)
+    mag = np.sqrt(u ** 2 + v ** 2)
+    angle = np.arctan2(v, u)
+    hsv = np.zeros((flow_hw, flow_hw, 3), dtype=np.uint8)
+    hsv[..., 0] = ((angle + np.pi) / (2 * np.pi) * 179).astype(np.uint8)
+    hsv[..., 1] = (np.clip(mag, 0, 1) * 255).astype(np.uint8)
+    hsv[..., 2] = 255
+    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    img = Image.fromarray(rgb, mode="RGB")
+    if flow_hw != 448:
+        img = img.resize((448, 448), Image.NEAREST)
+    return img
 
 
 @register_collate_fn
@@ -166,7 +174,8 @@ def drivelm_nus_phi4_collate_fn(
     dtype,
     use_optical_flow: bool = False,
     flow_root: str = "",
-    flow_scale: float = 32.0,
+    flow_scale_u: float = 8.778,
+    flow_scale_v: float = 2.888,
 ):
     prompts = [
         format_prompt_phi4(
@@ -180,11 +189,8 @@ def drivelm_nus_phi4_collate_fn(
     for example in examples:
         rgb_images = [Image.open(example["image_paths"][i]).convert("RGB") for i in range(6)]
         if use_optical_flow and flow_root:
-            flow_images = [
-                _flow_rgb_image_for_path(example["image_paths"][i], flow_root, flow_scale, flow_hw=14)
-                for i in range(6)
-            ]
-            images.append(rgb_images + flow_images)
+            flow_img = _flow_rgb_image_for_path(example["image_paths"][0], flow_root, flow_scale_u, flow_scale_v)
+            images.append(rgb_images + [flow_img])
         else:
             images.append(rgb_images)
     input_ids_list = []
@@ -194,10 +200,7 @@ def drivelm_nus_phi4_collate_fn(
     image_sizes_list = []
 
     for example, prompt, answer, image in zip(examples, prompts, answers, images):
-        if use_optical_flow and flow_root:
-            image = [img.resize((448, 448)) if i < 6 else img for i, img in enumerate(image)]
-        else:
-            image = [img.resize((448, 448)) for img in image]
+        image = [img.resize((448, 448)) for img in image]
         inputs = processor([prompt], images=image, return_tensors='pt')
         answer_ids = processor.tokenizer(answer, return_tensors='pt').input_ids
         input_ids = torch.cat([inputs.input_ids, answer_ids], dim=1)
@@ -241,7 +244,8 @@ def drivelm_nus_phi4_collate_fn_val(
     dtype,
     use_optical_flow: bool = False,
     flow_root: str = "",
-    flow_scale: float = 32.0,
+    flow_scale_u: float = 8.778,
+    flow_scale_v: float = 2.888,
 ):
     ids = [example["id"] for example in examples]
     questions = [example["conversations"][0]['value'] for example in examples]
@@ -252,9 +256,6 @@ def drivelm_nus_phi4_collate_fn_val(
         )
         for example in examples
     ]
-    # Flatten (RGB6 [+FLOW6]) x B samples into a single list in prompt order.
-    # The Phi-4 processor handles batched left padding internally
-    # (see processing_phi4mm.py, "batched inference requires left padding").
     flat_images = []
     for example in examples:
         rgb_images = [
@@ -263,11 +264,8 @@ def drivelm_nus_phi4_collate_fn_val(
         ]
         flat_images.extend(rgb_images)
         if use_optical_flow and flow_root:
-            flow_images = [
-                _flow_rgb_image_for_path(example["image_paths"][i], flow_root, flow_scale, flow_hw=14)
-                for i in range(6)
-            ]
-            flat_images.extend(flow_images)
+            flow_img = _flow_rgb_image_for_path(example["image_paths"][0], flow_root, flow_scale_u, flow_scale_v)
+            flat_images.append(flow_img)
     tokens = processor(
         text=prompts, images=flat_images, return_tensors="pt", padding="longest"
     )

@@ -34,7 +34,8 @@ def main(args):
         dtype=torch.bfloat16,
         use_optical_flow=args.use_optical_flow,
         flow_root=args.flow_root or "",
-        flow_scale=args.flow_scale,
+        flow_scale_u=args.flow_scale_u,
+        flow_scale_v=args.flow_scale_v,
     )
     dataset = load_from_disk(args.data)
     if args.limit is not None and args.limit > 0:
@@ -91,7 +92,8 @@ def parse_args():
         help="5-channel SigLIP; requires precomputed .npz under --flow_root.",
     )
     parser.add_argument("--flow_root", type=str, default="", help="flow/CAM/*.npz root")
-    parser.add_argument("--flow_scale", type=float, default=32.0)
+    parser.add_argument("--flow_scale_u", type=float, default=8.778)
+    parser.add_argument("--flow_scale_v", type=float, default=2.888)
     args = parser.parse_args()
     return args
 

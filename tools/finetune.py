@@ -102,7 +102,8 @@ def train(args):
         dtype=config.dtype,
         use_optical_flow=getattr(config, "use_optical_flow", False),
         flow_root=getattr(config, "flow_root", "") or "",
-        flow_scale=getattr(config, "flow_scale", 32.0),
+        flow_scale_u=getattr(config, "flow_scale_u", 8.778),
+        flow_scale_v=getattr(config, "flow_scale_v", 2.888),
     )
     dataloader = prepare_training_dataloader(config, train_collate_fn)
 
