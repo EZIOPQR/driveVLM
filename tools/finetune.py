@@ -19,6 +19,20 @@ from drivevlms.utils import (prepare_training_dataloader,
 from accelerate.utils import (get_mixed_precision_context_manager,
                               convert_outputs_to_fp32)
 from types import MethodType
+
+
+def _flow_patch_weight_mean_abs(unwrap_model):
+    """Mean absolute value of SigLIP patch conv weights on flow input channels (if expanded to 5ch)."""
+    try:
+        patch = unwrap_model.model.embed_tokens_extend.image_embed.img_processor.embeddings.patch_embedding
+        w = patch.weight
+        if w.shape[1] <= 3:
+            return None
+        return w[:, 3:].abs().mean().float().item()
+    except Exception:
+        return None
+
+
 # The default distributed training wrapper in the accelerate library does not allow passing 
 # `find_unused_parameters=True` to DistributedDataParallel (DDP).Since the phi4 model requires
 #  this setting, we inherit from accelerate and override the `prepare_model` method.
@@ -178,13 +192,25 @@ def train(args):
                     progress_bar.update(1)
 
                     if global_step % config.print_steps == 0:
-                        accelerator.print(
-                            f"Epoch {epoch}, Step {global_step}, Loss {loss.item()}"
-                        )
+                        if accelerator.is_local_main_process:
+                            umodel = accelerator.unwrap_model(model)
+                            pm = _flow_patch_weight_mean_abs(umodel)
+                            if pm is not None:
+                                print(
+                                    f"Epoch {epoch}, Step {global_step}, Loss {loss.item()}, "
+                                    f"patch_embed.weight[:, 3:].abs().mean()={pm}",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"Epoch {epoch}, Step {global_step}, Loss {loss.item()}",
+                                    flush=True,
+                                )
 
                     if (
                         resumed or global_step % config.log_steps == 0
                     ):  # log immediately after resuming
+                        _lrs = scheduler.get_last_lr()
                         log_data = {
                             "train/loss": accelerator.gather(total_loss)
                             .detach()
@@ -192,7 +218,9 @@ def train(args):
                             .item()
                             / accelerator.num_processes
                             / total_loss_count,
-                            "train/learning_rate": scheduler.get_last_lr()[0],
+                            "train/learning_rate": (
+                                _lrs[-1] if len(_lrs) > 1 else _lrs[0]
+                            ),
                             "train/global_step": global_step,
                             "train/epoch": global_step
                             / num_training_steps
@@ -203,6 +231,8 @@ def train(args):
                                 else grad_norm
                             ),
                         }
+                        if len(_lrs) > 1:
+                            log_data["train/learning_rate_patch"] = _lrs[0]
                         accelerator.log(log_data, step=global_step)
 
                         write_log_to_json(log_data, step=global_step, file_path=args.log_path)

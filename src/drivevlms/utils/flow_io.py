@@ -23,6 +23,8 @@ def load_flow_uv_tensor(
     device: torch.device,
 ) -> torch.Tensor:
     """Return [2, H, W] flow (u,v) scaled by ``1/flow_scale``, float tensor."""
+    if float(flow_scale) == 0.0:
+        raise ValueError("flow_scale must be non-zero")
     path = flow_npz_path_for_image(image_path, flow_root)
     u = np.zeros((height, width), dtype=np.float32)
     v = np.zeros((height, width), dtype=np.float32)

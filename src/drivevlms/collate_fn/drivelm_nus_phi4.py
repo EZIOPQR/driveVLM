@@ -103,7 +103,11 @@ def _inject_flow_into_image_embeds(
     flow_scale: float,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """input_image_embeds: [N_img, 1, 3, H, W] -> [N_img, 1, 5, H, W]."""
+    """input_image_embeds: [N_img, N_crop, 3, H, W] -> [N_img, N_crop, 5, H, W].
+
+    Same camera / keyframe shares one flow .npz; if ``N_crop>1`` (e.g. multi-crop),
+    u/v are broadcast along the crop dimension.
+    """
     device = input_image_embeds.device
     n, _, c, h, w = input_image_embeds.shape
     if c != 3:
@@ -113,7 +117,8 @@ def _inject_flow_into_image_embeds(
         rgb = input_image_embeds[i]
         path = image_paths_for_example[i]
         uv = load_flow_uv_tensor(path, flow_root, h, w, flow_scale, dtype, device)
-        uv = uv.unsqueeze(0)
+        nc = rgb.shape[0]
+        uv = uv.unsqueeze(0).expand(nc, -1, -1, -1).contiguous()
         out.append(torch.cat([rgb, uv], dim=1))
     return torch.stack(out, dim=0)
 
@@ -140,7 +145,7 @@ def drivelm_nus_phi4_collate_fn(
     image_attention_mask_list = []
     image_sizes_list = []
 
-    for prompt, answer, image in zip(prompts, answers, images):
+    for example, prompt, answer, image in zip(examples, prompts, answers, images):
         image = [img.resize((448, 448), ) for img in image]
         inputs = processor([prompt], images=image, return_tensors='pt')
         if use_optical_flow and flow_root:
