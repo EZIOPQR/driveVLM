@@ -28,7 +28,7 @@ cd /root/DriveVLMs_v3
 | `--output` | `data/DriveLM_nuScenes/refs/infer_results_21-49.json` | 结果 JSON，**增量写盘**（崩了不丢） |
 | `--device` | `cuda` | |
 | `--limit N` | `None` | 只跑前 N 条，做 smoke test 用 |
-| `--use_optical_flow` | off | 需 `--flow_root`，5 路 SigLIP |
+| `--use_optical_flow` | off | 需 `--flow_root`；输入变为 6 RGB + 6 flow 图像 |
 | `--flow_root` | `""` | 光流 `.npz` 根目录 |
 | `--flow_scale` | `32` | 与训练一致 |
 
@@ -54,7 +54,7 @@ python tools/inference.py \
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `--data` / `--collate_fn` / `--model` / `--device` / `--limit` / `--output` | 同上 | |
-| `--batch_size` | `4` | bf16 + 6×448 图：B=4 约 24GB 显存，B=8 需要 40GB+ |
+| `--batch_size` | `4` | bf16 + 12 图（6×448 RGB + 6×14 flow）：B=4 约 24GB 显存，B=8 需要更大显存 |
 | `--max_new_tokens` | `256` | DriveLM 答案最长 ~80 token，256 足够；调小可继续提速 |
 | `--num_workers` | `8` | DataLoader 进程数 |
 | `--use_optical_flow` | off | 与训练一致时打开；需 `--flow_root` |
@@ -191,20 +191,20 @@ python tools/evaluation.py \
     --tgt data/DriveLM_nuScenes/refs/val_cot.json
 ```
 
-## 6. 光流侧车（5 通道 SigLIP，可选）
+## 6. 光流侧车（12 图输入，可选）
 
-先用 `sweeps/` 离线生成与 `samples/CAM/*.jpg` 同主文件名的 `flow/CAM/<stem>.npz`（字段 `u`,`v`，448×448）：
+先用 `sweeps/` 离线生成与 `samples/CAM/*.jpg` 同主文件名的 `flow/CAM/<stem>.npz`（字段 `u`,`v`，14×14）：
 
 ```bash
 python tools/create_data/compute_flow_from_sweeps.py \\
     data/DriveLM_nuScenes/QA_dataset_nus/v1_1_train_nus.json \\
     --nuscenes-root /path/to/nuscenes \\
     --flow-root data/DriveLM_nuScenes/flow \\
-    --out-size 448
+    --out-size 14
 ```
 
-- **训练**：在 `configs/phi4/phi4_drivelm_1xb1-lora_config.py` 中设 `use_optical_flow=True`，并配置 `flow_root` 与 `flow_scale`。
-- **推理**：`inference.py` / `inference_batch.py` 增加 `--use_optical_flow --flow_root <dir> [--flow_scale 32]`；`--model` 须与训练时的输入通道一致（5 路微调权重或 base 上显式 `expand` 后加载）。
+- **训练**：在 `configs/phi4/phi4_drivelm_1xb1-lora_config.py` 中设 `use_optical_flow=True`，并配置 `flow_root` 与 `flow_scale`。此时每个样本输入为 12 图：前 6 张 RGB，后 6 张 flow。
+- **推理**：`inference.py` / `inference_batch.py` 增加 `--use_optical_flow --flow_root <dir> [--flow_scale 32]`；不再需要扩展 SigLIP 首层卷积通道。
 
 示例：
 

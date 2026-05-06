@@ -1,8 +1,11 @@
 from transformers import BatchFeature
 from ..registry import register_collate_fn
 from PIL import Image
+import os
+import numpy as np
+from drivevlms.utils.flow_io import flow_npz_path_for_image
 
-def format_prompt_phi4(instruction, input=None):
+def format_prompt_phi4(instruction, input=None, include_flow_images: bool = False):
 
     PROMPT_DICT = {
         "prompt_input": (
@@ -36,10 +39,42 @@ def format_prompt_phi4(instruction, input=None):
             "3. **If the answer references objects in the scene**: list them using the tag format above, separated by commas. \n"
             "4. **Otherwise**: write one concise sentence (two at most). Do not repeat the question; do not pad.\n\n"
             "### Instruction:\n{instruction}\n\n### Response:<|end|><|assistant|>"
+        ),
+        "prompt_no_input_with_flow": (
+            "<|user|><|image_1|><|image_2|><|image_3|><|image_4|><|image_5|><|image_6|>"
+            "<|image_7|><|image_8|><|image_9|><|image_10|><|image_11|><|image_12|>"
+            "You are an autonomous-driving perception assistant. The twelve images above are ordered as: "
+            "first six RGB surround-view camera images, then six optical-flow images aligned one-to-one by camera order.\n\n"
+            "## Camera order\n"
+            "The 6 camera slots are provided in this fixed order:\n"
+            "1. `CAM_FRONT`\n"
+            "2. `CAM_FRONT_LEFT`\n"
+            "3. `CAM_FRONT_RIGHT`\n"
+            "4. `CAM_BACK`\n"
+            "5. `CAM_BACK_LEFT`\n"
+            "6. `CAM_BACK_RIGHT`\n\n"
+            "RGB images are image_1 to image_6. "
+            "Flow images are image_7 to image_12, in the same camera order.\n\n"
+            "## Object reference tag format\n"
+            "Whenever an object is referenced — **both when you read the question and when you write the answer** — use exactly this tag:\n\n"
+            "`<c{{ID}},{{CAMERA}},{{X}},{{Y}}>`\n\n"
+            "- `c{{ID}}` — sequential object handle: `c1`, `c2`, `c3`, ...\n"
+            "- `{{CAMERA}}` — one of the 6 camera names above (uppercase, with underscores, no quotes)\n"
+            "- `{{X}}`, `{{Y}}` — pixel coordinates of the object center in the **224x224** image coordinate system, as floats with 2 decimal places\n\n"
+            "Example: `<c1,CAM_FRONT_RIGHT,25.06,103.09>`\n\n"
+            "## Reading rule\n"
+            "When the question contains tags like `<ci,CAM_xxx,x,y>`, treat each tag as a pointer to one specific object visible in the named camera at the given pixel location. Resolve every tag to a real object before answering.\n\n"
+            "## Answering rules\n"
+            "1. **Multiple-choice question** (ends with `Please select the correct answer from the following options: A. ... B. ... C. ... D. ...`): respond with **only** the single letter `A`, `B`, `C`, or `D`. No explanation.\n"
+            "2. **Yes/No question**: respond with `Yes.` or `No.`.\n"
+            "3. **If the answer references objects in the scene**: list them using the tag format above, separated by commas. \n"
+            "4. **Otherwise**: write one concise sentence (two at most). Do not repeat the question; do not pad.\n\n"
+            "### Instruction:\n{instruction}\n\n### Response:<|end|><|assistant|>"
         )
     }
     if input is None:
-        return PROMPT_DICT['prompt_no_input'].format_map({'instruction': instruction})
+        key = "prompt_no_input_with_flow" if include_flow_images else "prompt_no_input"
+        return PROMPT_DICT[key].format_map({'instruction': instruction})
     else:
         return PROMPT_DICT["prompt_input"].format_map({'instruction': instruction, 'input': input})
     
@@ -91,36 +126,37 @@ def cat_with_pad(tensors, dim, padding_value=0):
     return output
 
 import torch
-import copy
-from drivevlms.utils.flow_io import load_flow_uv_tensor
 
 _IGNORE_INDEX = -100
 _MAX_TRAINING_LENGTH = 8192
-def _inject_flow_into_image_embeds(
-    input_image_embeds: torch.Tensor,
-    image_paths_for_example: list,
+def _flow_rgb_image_for_path(
+    image_path: str,
     flow_root: str,
     flow_scale: float,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """input_image_embeds: [N_img, N_crop, 3, H, W] -> [N_img, N_crop, 5, H, W].
-
-    Same camera / keyframe shares one flow .npz; if ``N_crop>1`` (e.g. multi-crop),
-    u/v are broadcast along the crop dimension.
-    """
-    device = input_image_embeds.device
-    n, _, c, h, w = input_image_embeds.shape
-    if c != 3:
-        return input_image_embeds
-    out = []
-    for i in range(n):
-        rgb = input_image_embeds[i]
-        path = image_paths_for_example[i]
-        uv = load_flow_uv_tensor(path, flow_root, h, w, flow_scale, dtype, device)
-        nc = rgb.shape[0]
-        uv = uv.unsqueeze(0).expand(nc, -1, -1, -1).contiguous()
-        out.append(torch.cat([rgb, uv], dim=1))
-    return torch.stack(out, dim=0)
+    flow_hw: int = 14,
+) -> Image.Image:
+    """Load CAM/*.npz flow and pack normalized (u,v) into a 14x14 RGB image."""
+    if float(flow_scale) == 0.0:
+        raise ValueError("flow_scale must be non-zero")
+    flow_path = flow_npz_path_for_image(image_path, flow_root)
+    u = np.zeros((flow_hw, flow_hw), dtype=np.float32)
+    v = np.zeros((flow_hw, flow_hw), dtype=np.float32)
+    if flow_root and os.path.isfile(flow_path):
+        z = np.load(flow_path)
+        raw_valid = z.get("valid", np.array(True))
+        valid = bool(raw_valid.item()) if isinstance(raw_valid, np.ndarray) and raw_valid.size else bool(raw_valid)
+        if valid:
+            u_raw = np.asarray(z["u"], dtype=np.float32)
+            v_raw = np.asarray(z["v"], dtype=np.float32)
+            if u_raw.shape == (flow_hw, flow_hw) and v_raw.shape == (flow_hw, flow_hw):
+                u = u_raw
+                v = v_raw
+    u = np.clip(u / float(flow_scale), -1.0, 1.0)
+    v = np.clip(v / float(flow_scale), -1.0, 1.0)
+    rgb = np.zeros((flow_hw, flow_hw, 3), dtype=np.uint8)
+    rgb[..., 0] = ((u + 1.0) * 127.5).astype(np.uint8)
+    rgb[..., 1] = ((v + 1.0) * 127.5).astype(np.uint8)
+    return Image.fromarray(rgb, mode="RGB")
 
 
 @register_collate_fn
@@ -132,13 +168,25 @@ def drivelm_nus_phi4_collate_fn(
     flow_root: str = "",
     flow_scale: float = 32.0,
 ):
-    prompts = [format_prompt_phi4(example["conversations"][0]['value']) for example in examples]
+    prompts = [
+        format_prompt_phi4(
+            example["conversations"][0]['value'],
+            include_flow_images=bool(use_optical_flow and flow_root),
+        )
+        for example in examples
+    ]
     answers = [format_answer(example["conversations"][1]['value']) for example in examples]
     images = []
     for example in examples:
-        image = [Image.open(example["image_paths"][i]).convert("RGB") for i in range(6)]
-        # image = [Image.open(example["image_paths"][0]).convert("RGB")]
-        images.append(image)
+        rgb_images = [Image.open(example["image_paths"][i]).convert("RGB") for i in range(6)]
+        if use_optical_flow and flow_root:
+            flow_images = [
+                _flow_rgb_image_for_path(example["image_paths"][i], flow_root, flow_scale, flow_hw=14)
+                for i in range(6)
+            ]
+            images.append(rgb_images + flow_images)
+        else:
+            images.append(rgb_images)
     input_ids_list = []
     labels_list = []
     input_image_embeds_list = []
@@ -146,16 +194,11 @@ def drivelm_nus_phi4_collate_fn(
     image_sizes_list = []
 
     for example, prompt, answer, image in zip(examples, prompts, answers, images):
-        image = [img.resize((448, 448), ) for img in image]
-        inputs = processor([prompt], images=image, return_tensors='pt')
         if use_optical_flow and flow_root:
-            inputs.input_image_embeds = _inject_flow_into_image_embeds(
-                inputs.input_image_embeds,
-                example["image_paths"],
-                flow_root,
-                flow_scale,
-                dtype=torch.float32,
-            )
+            image = [img.resize((448, 448)) if i < 6 else img for i, img in enumerate(image)]
+        else:
+            image = [img.resize((448, 448)) for img in image]
+        inputs = processor([prompt], images=image, return_tensors='pt')
         answer_ids = processor.tokenizer(answer, return_tensors='pt').input_ids
         input_ids = torch.cat([inputs.input_ids, answer_ids], dim=1)
         labels = torch.full_like(input_ids, _IGNORE_INDEX)
@@ -202,34 +245,32 @@ def drivelm_nus_phi4_collate_fn_val(
 ):
     ids = [example["id"] for example in examples]
     questions = [example["conversations"][0]['value'] for example in examples]
-    prompts = [format_prompt_phi4(example["conversations"][0]['value']) for example in examples]
-    # Flatten 6 cameras x B samples into a single list of B*6 PIL images, in the order
-    # sample0_cam0..5, sample1_cam0..5, ..., matching the 6 <|image_k|> tokens per prompt.
+    prompts = [
+        format_prompt_phi4(
+            example["conversations"][0]['value'],
+            include_flow_images=bool(use_optical_flow and flow_root),
+        )
+        for example in examples
+    ]
+    # Flatten (RGB6 [+FLOW6]) x B samples into a single list in prompt order.
     # The Phi-4 processor handles batched left padding internally
     # (see processing_phi4mm.py, "batched inference requires left padding").
     flat_images = []
     for example in examples:
-        for i in range(6):
-            img = Image.open(example["image_paths"][i]).convert("RGB").resize((448, 448))
-            flat_images.append(img)
+        rgb_images = [
+            Image.open(example["image_paths"][i]).convert("RGB").resize((448, 448))
+            for i in range(6)
+        ]
+        flat_images.extend(rgb_images)
+        if use_optical_flow and flow_root:
+            flow_images = [
+                _flow_rgb_image_for_path(example["image_paths"][i], flow_root, flow_scale, flow_hw=14)
+                for i in range(6)
+            ]
+            flat_images.extend(flow_images)
     tokens = processor(
         text=prompts, images=flat_images, return_tensors="pt", padding="longest"
     )
-    if use_optical_flow and flow_root:
-        n_img = tokens.input_image_embeds.shape[0]
-        paths_flat = []
-        for example in examples:
-            for i in range(6):
-                paths_flat.append(example["image_paths"][i])
-        assert len(paths_flat) == n_img, (len(paths_flat), n_img)
-        tokens.input_image_embeds = _inject_flow_into_image_embeds(
-            tokens.input_image_embeds,
-            paths_flat,
-            flow_root,
-            flow_scale,
-            dtype=torch.float32,
-        )
-
     return tokens, questions, ids
 
 

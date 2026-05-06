@@ -13,7 +13,6 @@ from peft import LoraConfig
 from peft.tuners.lora.layer import LoraLayer
 from drivevlms.models.phi4_bjxx import Phi4MMProcessor, Phi4MMForCausalLM
 from accelerate import Accelerator
-from drivevlms.utils.siglip_expand import expand_siglip_vision_patch_in_channels
 
 _PHI4_DEFAULT_HUB_REVISION = "607bf62a754018e31fb4b55abbc7d72cce4ffee5"
 
@@ -178,9 +177,6 @@ def prepare_model_and_processor_phi4(config):
     for param in image_embed.parameters():
         param.requires_grad = False
 
-    if getattr(config, "use_optical_flow", False):
-        expand_siglip_vision_patch_in_channels(model, 5)
-
     _configure_image_embed_trainability(model, config)
 
     if getattr(config, "train_llm_lora", True):
@@ -236,8 +232,6 @@ def prepare_model_and_processor_phi4_add_lora(config):
     image_embed = model.model.embed_tokens_extend.image_embed
     for p in image_embed.parameters():
         p.requires_grad = False
-    if getattr(config, "use_optical_flow", False):
-        expand_siglip_vision_patch_in_channels(model, 5)
     _configure_image_embed_trainability(model, config)
     if getattr(config, "train_llm_lora", True):
         _set_llm_adapter_trainable(model, "domain", True)
@@ -283,8 +277,6 @@ def prepare_model_and_processor_phi4_merge_vision(config):
     image_embed = model.model.embed_tokens_extend.image_embed
     for p in image_embed.parameters():
         p.requires_grad = False
-    if getattr(config, "use_optical_flow", False):
-        expand_siglip_vision_patch_in_channels(model, 5)
     _configure_image_embed_trainability(model, config)
     if getattr(config, "train_llm_lora", True):
         _set_llm_adapter_trainable(model, "vision", True)

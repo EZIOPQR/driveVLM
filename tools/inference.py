@@ -9,7 +9,6 @@ from tqdm import tqdm
 from functools import partial
 import argparse
 from drivevlms.build import build_collate_fn
-from drivevlms.utils.siglip_expand import expand_siglip_vision_patch_in_channels
 import json
 
 @torch.no_grad()
@@ -24,8 +23,6 @@ def main(args):
         _attn_implementation='flash_attention_2',
         trust_remote_code=True
     )
-    if args.use_optical_flow:
-        expand_siglip_vision_patch_in_channels(model, 5)
     model.to(args.device)
     generation_config = GenerationConfig.from_pretrained(base_model)
 

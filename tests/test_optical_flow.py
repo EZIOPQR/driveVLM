@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,8 @@ _siglip = _load(Path("utils") / "siglip_expand.py", "siglip_expand_mod")
 flow_npz_path_for_image = _flow_io.flow_npz_path_for_image
 load_flow_uv_tensor = _flow_io.load_flow_uv_tensor
 expand_siglip_vision_patch_in_channels = _siglip.expand_siglip_vision_patch_in_channels
+sys.path.insert(0, str(_SRC))
+from drivevlms.collate_fn.drivelm_nus_phi4 import format_prompt_phi4  # noqa: E402
 
 
 class TestFlowIO(unittest.TestCase):
@@ -147,6 +150,18 @@ class TestSiglipExpand(unittest.TestCase):
         self.assertTrue(torch.all(conv.weight[:, 3:] == 0))
         expand_siglip_vision_patch_in_channels(m, 5)
         self.assertEqual(conv.in_channels, 5)
+
+
+class TestFlowImagePrompt(unittest.TestCase):
+    def test_prompt_expands_to_12_image_slots_when_flow_enabled(self) -> None:
+        p = format_prompt_phi4("x", include_flow_images=True)
+        self.assertIn("<|image_12|>", p)
+        self.assertIn("<|image_7|>", p)
+
+    def test_prompt_keeps_6_image_slots_without_flow(self) -> None:
+        p = format_prompt_phi4("x", include_flow_images=False)
+        self.assertIn("<|image_6|>", p)
+        self.assertNotIn("<|image_7|>", p)
 
 
 if __name__ == "__main__":

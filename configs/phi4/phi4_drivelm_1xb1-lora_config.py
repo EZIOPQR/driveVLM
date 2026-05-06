@@ -18,11 +18,11 @@ class DriveLMNusPhi4Config:
     run_name: str = f"FULL-{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
     output_dir: str = "/root/autodl-tmp/pretrained/phi4/" + f"{run_name}"
 
-    num_train_epochs: int = 3
+    num_train_epochs: int = 1
     batch_size_per_gpu: int = 1
     gradient_accumulation_steps: int = 8
     lr: float = 5e-6
-    # SigLIP patch_embedding (incl. optical-flow channels); None → same as ``lr``.
+    # SigLIP patch_embedding lr; None -> same as ``lr``.
     lr_patch_conv: Optional[float] = 5e-5
     lora_r: int = 32
     warmup_steps: int = 150
@@ -44,16 +44,17 @@ class DriveLMNusPhi4Config:
 
     find_unused_parameters: bool = True
 
-    # SigLIP: train patch conv + img_projection by default; set train_siglip_encoder=True for full ViT.
+    # SigLIP: freeze vision encoder/patch/projection by default; train only LLM LoRA.
     train_siglip_encoder: bool = False
-    train_siglip_patch_conv: bool = True
-    train_image_projection: bool = True
+    train_siglip_patch_conv: bool = False
+    train_image_projection: bool = False
     train_llm_lora: bool = True
 
-    # Sweep-based optical flow (5-channel SigLIP input). Set True after running
-    # tools/create_data/compute_flow_from_sweeps.py and setting flow_root.
+    # Sweep-based optical flow as extra images:
+    # - False: 6 RGB images
+    # - True: 6 RGB + 6 flow images (flow kept at 14x14, not channel-expanded)
     use_optical_flow: bool = True
     flow_root: str = "/root/autodl-tmp/flow"
-    flow_scale: float = 448.0
+    flow_scale: float = 14.0
 
 config = DriveLMNusPhi4Config()

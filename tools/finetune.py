@@ -118,6 +118,13 @@ def train(args):
     dataloader, model, optimizer, scheduler = accelerator.prepare(
         dataloader, model, optimizer, lr_scheduler
     )
+    try:
+        _prepared_dl_len = len(dataloader)
+    except TypeError:
+        _prepared_dl_len = "unknown"
+    accelerator.print(
+        f"[finetune] rank={accelerator.process_index} len(prepared_train_dataloader)={_prepared_dl_len}"
+    )
 
     progress_bar = tqdm(
         total=num_training_steps, disable=not accelerator.is_local_main_process
@@ -169,11 +176,21 @@ def train(args):
         if epoch < starting_epoch:
             continue
         train_dataloader = skipped_dataloader if epoch == starting_epoch else dataloader
+        try:
+            _epoch_dl_len = len(train_dataloader)
+        except TypeError:
+            _epoch_dl_len = "unknown"
+        accelerator.print(
+            f"[finetune] epoch={epoch} rank={accelerator.process_index} "
+            f"len(train_dataloader)={_epoch_dl_len}"
+        )
         model.train()
+        epoch_last_loss = None
         for batch in train_dataloader:
             with accelerator.accumulate(model):
                 output = model(**batch)
                 loss = output.loss
+                epoch_last_loss = loss.detach()
                 total_loss += loss.detach().cpu()
                 total_loss_count += 1
 
@@ -247,6 +264,15 @@ def train(args):
                     total_loss_count = 0
                     torch.cuda.empty_cache()  # 释放显存
 
+        if epoch_last_loss is None:
+            raise RuntimeError(
+                f"Epoch {epoch} completed with 0 training steps on rank "
+                f"{accelerator.process_index}. "
+                f"starting_epoch={starting_epoch}, global_step={global_step}, "
+                f"len(train_dataloader)={_epoch_dl_len}. "
+                f"If len>0, the batch loop exited before loss was set (check collate / forward)."
+            )
+
         epoch_path = f"{config.output_dir}/epoch-{epoch}"
         save_checkpoint(
             accelerator,
@@ -254,7 +280,7 @@ def train(args):
             epoch,
             global_step,
             config,
-            loss.item(),
+            float(epoch_last_loss.item()),
             checkpoint_dir=epoch_path,
         )
         save_lora_adapter(accelerator, model, epoch_path)
