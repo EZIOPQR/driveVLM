@@ -229,3 +229,7 @@ if __name__ == '__main__':
         print("[skip] accuracy bucket is empty (no tag=0 samples).")
 
     print(f"normalized scores: {scores}")
+
+    if scores:
+        avg = sum(scores.values()) / len(scores)
+        print(f"average score: {avg:.4f}")

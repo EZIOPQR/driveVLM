@@ -188,6 +188,9 @@ def train(args):
         model.train()
         epoch_last_loss = None
         for batch in train_dataloader:
+            if dataloader_step == 0:
+                accelerator.print(f"[DEBUG] batch input_image_embeds={batch['input_image_embeds'].shape}, "
+                      f"input_ids={batch['input_ids'].shape}")
             with accelerator.accumulate(model):
                 output = model(**batch)
                 loss = output.loss

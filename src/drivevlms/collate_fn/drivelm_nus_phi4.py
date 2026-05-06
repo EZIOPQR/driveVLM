@@ -134,7 +134,7 @@ def _flow_rgb_image_for_path(
     flow_scale_u: float,
     flow_scale_v: float,
 ) -> Image.Image:
-    """Load CAM/*.npz flow, visualize as HSV (angle→H, magnitude→S, V=255), resize to 448x448."""
+    """Load CAM/*.npz flow, visualize as Middlebury HSV (H=direction, S=1, V=magnitude), 448x448."""
     if float(flow_scale_u) == 0.0 or float(flow_scale_v) == 0.0:
         raise ValueError("flow_scale_u and flow_scale_v must be non-zero")
     flow_path = flow_npz_path_for_image(image_path, flow_root)
@@ -158,8 +158,8 @@ def _flow_rgb_image_for_path(
     angle = np.arctan2(v, u)
     hsv = np.zeros((flow_hw, flow_hw, 3), dtype=np.uint8)
     hsv[..., 0] = ((angle + np.pi) / (2 * np.pi) * 179).astype(np.uint8)
-    hsv[..., 1] = (np.clip(mag, 0, 1) * 255).astype(np.uint8)
-    hsv[..., 2] = 255
+    hsv[..., 1] = 255
+    hsv[..., 2] = (np.clip(mag, 0, 1) * 255).astype(np.uint8)
     rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     img = Image.fromarray(rgb, mode="RGB")
     if flow_hw != 448:
