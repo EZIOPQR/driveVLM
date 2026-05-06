@@ -6,6 +6,10 @@ prev-chain for the same camera, collects rows with timestamp in (t0-1s, t0],
 computes pairwise dense flow (Farneback), accumulates u/v with weights = Δt,
 saves flow/CAM/*.npz next to a configurable flow root (mirror samples/ layout).
 
+After Farneback + Δt-weighted average, **u** and **v** are **independently** clipped to
+±3σ using fixed global σ (see below); clip limits scale with ``--out-size`` vs the
+**448** reference grid the σ were estimated on.
+
 Requires:
   - v1.0-trainval metadata under NUSC_ROOT/v1.0-trainval/
   - sweeps/ and samples/ under NUSC_ROOT (camera blobs unpacked)
@@ -15,7 +19,7 @@ Usage:
     data/DriveLM_nuScenes/QA_dataset_nus/v1_1_train_nus.json \\
     --nuscenes-root /path/to/nuscenes \\
     --flow-root data/DriveLM_nuScenes/flow \\
-    --out-size 448 \\
+    --out-size 14 \\
     --workers 8
 """
 from __future__ import annotations
@@ -44,7 +48,13 @@ CAMS = (
 
 US_PER_S = 1_000_000
 
-# POSIX fork: workers inherit these (COW). Windows spawn: set via Pool initializer.
+# Dataset-wide σ from ``stats_flow_range.py`` (full nuScenes flow dump). Saved u/v are clipped
+# to ± FLOW_CLIP_SIGMA * σ per channel before float16 (values beyond are cut, not zeroed).
+FLOW_STATS_U_STD = 8.77799059738783
+FLOW_STATS_V_STD = 2.887801423657257
+FLOW_CLIP_SIGMA = 3.0
+# σ above were computed on flow saved at H=W=448; scale clip bounds when ``--out-size`` differs.
+FLOW_STATS_REF_OUT = 448
 _PAR_SD_BY_TOKEN: Optional[Dict[str, dict]] = None
 _PAR_KF_INDEX: Optional[Dict[Tuple[str, str], dict]] = None
 
@@ -68,7 +78,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Output root; writes flow/CAM/*.npz mirroring samples/CAM/*.jpg basenames.",
     )
-    p.add_argument("--out-size", type=int, default=448, help="Saved flow H=W (match training resize).")
+    p.add_argument(
+        "--out-size",
+        type=int,
+        default=14,
+        help="Saved flow H=W (default 14). Farneback field is resized to this grid.",
+    )
     p.add_argument(
         "--flow-compute-size",
         type=int,
@@ -204,6 +219,21 @@ def compute_pair_flow(
     return u.astype(np.float32), v.astype(np.float32)
 
 
+def clip_bounds_for_out_size(out_size: int) -> Tuple[float, float]:
+    """± bounds for u and v from global σ, scaled to this grid vs FLOW_STATS_REF_OUT."""
+    s = float(out_size) / float(FLOW_STATS_REF_OUT)
+    bu = float(FLOW_CLIP_SIGMA * FLOW_STATS_U_STD * s)
+    bv = float(FLOW_CLIP_SIGMA * FLOW_STATS_V_STD * s)
+    return bu, bv
+
+
+def clip_flow_uv_3sigma(
+    u: np.ndarray, v: np.ndarray, out_size: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    bu, bv = clip_bounds_for_out_size(out_size)
+    return np.clip(u, -bu, bu), np.clip(v, -bv, bv)
+
+
 def weighted_flow_average(
     chain: List[dict],
     nusc_root: Path,
@@ -291,6 +321,8 @@ def _process_one_task(
         t0 = int(kf_row["timestamp"])
         chain = causal_chain(kf_row, sd_by_token, t0)
         u, v, valid, w_sum = weighted_flow_average(chain, nusc, flow_compute_size, out_size)
+        u, v = clip_flow_uv_3sigma(u, v, out_size)
+        bu, bv = clip_bounds_for_out_size(out_size)
         np.savez_compressed(
             str(out_path),
             u=u.astype(np.float16),
@@ -298,6 +330,8 @@ def _process_one_task(
             valid=valid,
             w_sum=np.float32(w_sum),
             n_pairs=len(chain) - 1,
+            clip_bound_u=np.float32(bu),
+            clip_bound_v=np.float32(bv),
         )
         return "ok"
     except Exception as exc:  # noqa: BLE001
