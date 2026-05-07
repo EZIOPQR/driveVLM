@@ -2,7 +2,7 @@
 
 Per-sample scoring:
 - tag=0 (MCQ / yes-no)         -> exact match {0.0, 1.0}
-- tag=2 (free-form perception) -> single-sentence ROUGE-L F1
+- tag=2 (free-form perception) -> corpus-level BLEU/ROUGE_L/CIDEr (same as evaluation.py)
 - tag=3 (object coords)        -> match-F1 (same logic as tools/evaluation.py)
 - tag=1 (planning)             -> dropped (no auto score in evaluation.py either)
 
@@ -29,6 +29,8 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
+
+import language_evaluation
 
 # ---------------------------------------------------------------------------
 # scoring
@@ -227,6 +229,39 @@ def to_img_src(image_path: str) -> str:
     return image_path
 
 
+def _build_graph(pred: str, gt: str) -> list[list[float]]:
+    """Mirrors evaluation_suit.set_graph: return matched GT coord pairs."""
+    if isinstance(pred, list):
+        pred = pred[0]
+    gt_pairs = coord_pairs(gt)
+    pred_pairs = coord_pairs(pred)
+    remaining = list(range(len(gt_pairs)))
+    matched_gt: list[list[float]] = []
+    for p in pred_pairs:
+        best_gi, best_d = None, float("inf")
+        for gi in remaining:
+            g = gt_pairs[gi]
+            d = abs(p[0] - g[0]) + abs(p[1] - g[1])
+            if d < best_d:
+                best_gi, best_d = gi, d
+        if best_gi is not None and best_d < 16:
+            matched_gt.append([gt_pairs[best_gi][0], gt_pairs[best_gi][1]])
+            remaining.remove(best_gi)
+    return matched_gt
+
+
+def _eval_graph(question: str, graph: list[list[float]]) -> bool:
+    """Mirrors evaluation_suit.eval_graph: check all question coords are in graph."""
+    nums = _FLOAT_RE.findall(question)
+    if len(nums) % 2 != 0:
+        nums = nums[:-1]
+    q_pairs = [[float(nums[i]), float(nums[i + 1])] for i in range(0, len(nums), 2)]
+    for q in q_pairs:
+        if q not in graph:
+            return False
+    return True
+
+
 def load_aligned(src_path: str, gt_path: str):
     """Return list of dicts: id, scene_id, frame_id, qa_idx, tag, question, gt, pred, image_paths."""
     with open(src_path) as f:
@@ -245,14 +280,30 @@ def load_aligned(src_path: str, gt_path: str):
                + frame["QA"]["prediction"]
                + frame["QA"]["planning"]
                + frame["QA"]["behavior"])
+
+        graph: list[list[float]] = []
+        first_flag = True
+
         for i, qa in enumerate(qas):
             tag_list = qa["tag"]
-            # Drop tag=1 (planning, no auto score).
+            sid = f"{scene_id}_{frame_id}_{i}"
+
+            if sid not in pred_by_id:
+                break
+
+            pred_answer = pred_by_id[sid]["answer"]
+            gt_answer = qa["A"]
+
+            if first_flag:
+                first_flag = False
+                graph = _build_graph(pred_answer, gt_answer)
+            else:
+                if not _eval_graph(qa["Q"], graph):
+                    continue
+
             if not (0 in tag_list or 2 in tag_list or 3 in tag_list):
                 continue
-            sid = f"{scene_id}_{frame_id}_{i}"
-            if sid not in pred_by_id:
-                continue
+
             tag = 0 if 0 in tag_list else (2 if 2 in tag_list else 3)
             out.append({
                 "id": sid,
@@ -261,8 +312,8 @@ def load_aligned(src_path: str, gt_path: str):
                 "qa_idx": i,
                 "tag": tag,
                 "question": qa["Q"],
-                "gt": qa["A"],
-                "pred": pred_by_id[sid]["answer"],
+                "gt": gt_answer,
+                "pred": pred_answer,
                 "image_paths": image_paths,
             })
     return out
@@ -377,7 +428,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
     <span>__SRC_NAME__</span>
     <span class="metric">n=__N_TOTAL__</span>
     <span class="metric">tag0 acc=__ACC__</span>
-    <span class="metric">tag2 rougeL=__ROUGE__</span>
+    <span class="metric">tag2 language=__ROUGE__</span>
     <span class="metric">tag3 f1=__MATCH__</span>
   </div>
   <label>tag:
@@ -730,17 +781,37 @@ def build_records(aligned):
 
 def build_summary(records, src_name: str):
     by_tag = {0: [], 2: [], 3: []}
+    tag2_preds: list[str] = []
+    tag2_gts: list[str] = []
     for r in records:
         by_tag[r["tag"]].append(r["score"])
+        if r["tag"] == 2:
+            tag2_preds.append(r["pred"])
+            tag2_gts.append(r["gt"])
 
     def avg(xs):
         return round(sum(xs) / len(xs), 4) if xs else None
+
+    # Corpus-level language score (same as evaluation.py)
+    tag2_score = None
+    if tag2_preds:
+        coco_eval = language_evaluation.CocoEvaluator(coco_types=["BLEU", "ROUGE_L", "CIDEr"])
+        results_gen = coco_eval.run_evaluation(tag2_preds, tag2_gts)
+        score = 0.0
+        for idx, key in enumerate(results_gen.keys()):
+            if idx < 4:
+                score += results_gen[key] / 4.0 / 3.0
+            elif idx == 4:
+                score += results_gen[key] / 3.0
+            else:
+                score += results_gen[key] / 10.0 / 3.0
+        tag2_score = round(score, 4)
 
     return {
         "src_name": src_name,
         "n_total": len(records),
         "tag0": {"n": len(by_tag[0]), "accuracy": avg(by_tag[0])},
-        "tag2": {"n": len(by_tag[2]), "rougeL_mean": avg(by_tag[2])},
+        "tag2": {"n": len(by_tag[2]), "language": tag2_score},
         "tag3": {"n": len(by_tag[3]), "f1_mean": avg(by_tag[3])},
     }
 
@@ -755,7 +826,7 @@ def render_html(records, summary) -> str:
     html = html.replace("__SRC_NAME__", summary["src_name"])
     html = html.replace("__N_TOTAL__", str(summary["n_total"]))
     html = html.replace("__ACC__", fmt_metric(summary["tag0"]["accuracy"]))
-    html = html.replace("__ROUGE__", fmt_metric(summary["tag2"]["rougeL_mean"]))
+    html = html.replace("__ROUGE__", fmt_metric(summary["tag2"]["language"]))
     html = html.replace("__MATCH__", fmt_metric(summary["tag3"]["f1_mean"]))
     html = html.replace("__RECORDS_JSON__",
                         json.dumps(records, ensure_ascii=False, separators=(",", ":")))
