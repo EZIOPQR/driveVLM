@@ -1,15 +1,71 @@
-import torch
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, GenerationConfig
-from peft import PeftModel
+import time
+import json
 import argparse
+from functools import partial
+
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from datasets import load_from_disk
 from tqdm import tqdm
-from functools import partial
-import argparse
+from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
+
 from drivevlms.build import build_collate_fn
-import json
+
+
+class LatencyProfiler:
+    """Measures vision tower, LLM prefill, and LLM decode latencies via forward hooks."""
+
+    def __init__(self, model, device="cuda"):
+        self.device = device
+        self._hooks = []
+        self.reset()
+
+        vision_tower = model.model.embed_tokens_extend.image_embed
+        backbone = model.model
+
+        self._hooks.append(vision_tower.register_forward_pre_hook(self._vision_pre))
+        self._hooks.append(vision_tower.register_forward_hook(self._vision_post))
+        self._hooks.append(backbone.register_forward_pre_hook(self._backbone_pre))
+        self._hooks.append(backbone.register_forward_hook(self._backbone_post))
+
+    def reset(self):
+        self.vision_ms = 0.0
+        self.prefill_ms = 0.0
+        self.decode_ms = 0.0
+        self._backbone_call_count = 0
+        self._vision_start = 0.0
+        self._backbone_start = 0.0
+
+    def _vision_pre(self, module, input):
+        torch.cuda.synchronize(self.device)
+        self._vision_start = time.perf_counter()
+
+    def _vision_post(self, module, input, output):
+        torch.cuda.synchronize(self.device)
+        self.vision_ms += (time.perf_counter() - self._vision_start) * 1000
+
+    def _backbone_pre(self, module, input):
+        torch.cuda.synchronize(self.device)
+        self._backbone_start = time.perf_counter()
+
+    def _backbone_post(self, module, input, output):
+        torch.cuda.synchronize(self.device)
+        elapsed_ms = (time.perf_counter() - self._backbone_start) * 1000
+        if self._backbone_call_count == 0:
+            self.prefill_ms = elapsed_ms - self.vision_ms
+        else:
+            self.decode_ms += elapsed_ms
+        self._backbone_call_count += 1
+
+    @property
+    def num_decode_steps(self):
+        return max(0, self._backbone_call_count - 1)
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
 
 @torch.no_grad()
 def main(args):
@@ -24,7 +80,10 @@ def main(args):
         trust_remote_code=True
     )
     model.to(args.device)
+    model.eval()
     generation_config = GenerationConfig.from_pretrained(base_model)
+
+    profiler = LatencyProfiler(model, device=args.device) if args.profile else None
 
     # prepare dataset
     collate_fn = build_collate_fn(args.collate_fn)
@@ -59,24 +118,49 @@ def main(args):
         )
         output = output[:, input_len:]
         results = processor.batch_decode(output, skip_special_tokens=True)
-        return results
+        return results, input_len, output.shape[-1]
 
     def flatten(x):
         return x[0] if isinstance(x, list) else x
-    
+
+    warmup_steps = args.warmup if profiler else 0
+    all_vision_ms = []
+    all_prefill_ms_per_token = []
+    all_decode_ms_per_token = []
+
     data_dict = []
     with torch.no_grad():
-        cnt = 0
-        for batch in tqdm(dataloader):
-            cnt += 1
+        for step, batch in enumerate(tqdm(dataloader)):
             inputs, question, ids = batch
-            results = infer(inputs.to(args.device))
+            if profiler:
+                profiler.reset()
+            results, input_len, num_tokens = infer(inputs.to(args.device))
+            if profiler and step >= warmup_steps:
+                all_vision_ms.append(profiler.vision_ms)
+                all_prefill_ms_per_token.append(profiler.prefill_ms / max(input_len, 1))
+                all_decode_ms_per_token.append(profiler.decode_ms / max(num_tokens, 1))
+
             data_dict.append(
                 {'id': flatten(ids), 'question': flatten(question), 'answer': flatten(results)}
             )
 
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(data_dict, f, indent=4)
+
+    if profiler:
+        profiler.remove_hooks()
+        vision_arr = np.array(all_vision_ms)
+        prefill_arr = np.array(all_prefill_ms_per_token)
+        decode_arr = np.array(all_decode_ms_per_token)
+
+        print("\n" + "=" * 60)
+        print("Latency Profiling Summary")
+        print("=" * 60)
+        print(f"  Samples: {len(all_vision_ms)} (warmup skipped: {warmup_steps})")
+        print(f"  Vision Tower : {vision_arr.mean():.4f} ± {vision_arr.std():.4f} ms")
+        print(f"  LLM Prefill  : {prefill_arr.mean():.4f} ± {prefill_arr.std():.4f} ms/token")
+        print(f"  LLM Decode   : {decode_arr.mean():.4f} ± {decode_arr.std():.4f} ms/token")
+        print("=" * 60)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DriveLM Inference')
@@ -94,6 +178,12 @@ def parse_args():
     parser.add_argument("--flow_root", type=str, default="", help="flow/CAM/*.npz root")
     parser.add_argument("--flow_scale_u", type=float, default=8.778)
     parser.add_argument("--flow_scale_v", type=float, default=2.888)
+    parser.add_argument("--profile", action="store_true", default=True,
+                        help="Enable latency profiling (vision tower / LLM prefill / LLM decode)")
+    parser.add_argument("--no_profile", dest="profile", action="store_false",
+                        help="Disable latency profiling")
+    parser.add_argument("--warmup", type=int, default=3,
+                        help="Number of warmup samples to skip in latency statistics")
     args = parser.parse_args()
     return args
 
