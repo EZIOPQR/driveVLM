@@ -75,8 +75,11 @@ class DriveLMNusPhi4LocTokensConfig:
     n_loc_tokens: int = 112
     loc_token_stride: int = 4
 
-    # Optical flow (same as the LoRA baseline; toggle per experiment).
-    use_optical_flow: bool = True
+    # Optical flow: OFF by default for the loc-tokens experiment because the
+    # nuScenes detection-QA samples reference frames whose precomputed flow .npz
+    # sidecars likely don't exist under ``flow_root``. Re-enable only after you
+    # generate flow for every CAM_FRONT/*.jpg in the mixed dataset.
+    use_optical_flow: bool = False
     flow_root: str = "/root/autodl-tmp/flow_old"
     flow_scale_u: float = 8.778
     flow_scale_v: float = 2.888
