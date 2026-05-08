@@ -3,7 +3,7 @@ import json
 import os
 
 import torch
-from datasets import load_from_disk
+from datasets import load_from_disk, interleave_datasets
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
@@ -20,25 +20,45 @@ def _phi4_patch_embedding_params(model: torch.nn.Module):
         return []
 
 
+def _llm_embed_tokens_params(model: torch.nn.Module):
+    """Top-level token embedding (tied with lm_head). Empty list if not exposed."""
+    try:
+        m = model
+        if hasattr(model, "module"):
+            m = model.module
+        return list(m.get_input_embeddings().parameters())
+    except Exception:
+        return []
+
+
 def _adamw_param_groups(config, model: torch.nn.Module):
-    """Trainable params: group 0 = patch conv, group 1 = everything else (when split makes sense)."""
+    """Trainable params: split into patch-conv / embed-tokens / everything else."""
     lr = config.lr
     lr_patch = getattr(config, "lr_patch_conv", None)
     if lr_patch is None:
         lr_patch = lr
+    lr_embed = getattr(config, "lr_embed", None)
+    if lr_embed is None:
+        lr_embed = lr
     wd = config.weight_decay
 
     patch_list = _phi4_patch_embedding_params(model)
     patch_ids = {id(p) for p in patch_list}
+    embed_list = _llm_embed_tokens_params(model)
+    embed_ids = {id(p) for p in embed_list}
 
     patch_trainable = [p for p in patch_list if p.requires_grad]
+    embed_trainable = [p for p in embed_list if p.requires_grad]
     other_trainable = [
-        p for p in model.parameters() if p.requires_grad and id(p) not in patch_ids
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in patch_ids and id(p) not in embed_ids
     ]
 
     groups = []
     if patch_trainable:
         groups.append({"params": patch_trainable, "lr": lr_patch, "weight_decay": wd})
+    if embed_trainable:
+        groups.append({"params": embed_trainable, "lr": lr_embed, "weight_decay": wd})
     if other_trainable:
         groups.append({"params": other_trainable, "lr": lr, "weight_decay": wd})
 
@@ -47,8 +67,34 @@ def _adamw_param_groups(config, model: torch.nn.Module):
     return groups
 
 
+def _load_mixed_dataset(config):
+    """Build the training Dataset honoring single-path or weighted-list configs.
+
+    - ``config.dataset_names`` (preferred when set): list of (path, weight) tuples →
+      ``interleave_datasets`` with the given probabilities (auto-normalized).
+    - ``config.dataset_name`` (fallback): single path or list of paths
+      (concatenated 1:1).
+    """
+    names = getattr(config, "dataset_names", None)
+    if names:
+        paths = [p for p, _ in names]
+        weights = [float(w) for _, w in names]
+        s = sum(weights) or 1.0
+        probs = [w / s for w in weights]
+        parts = [load_from_disk(p) for p in paths]
+        return interleave_datasets(
+            parts, probabilities=probs, stopping_strategy="all_exhausted", seed=config.seed
+        )
+
+    single = config.dataset_name
+    if isinstance(single, (list, tuple)):
+        parts = [load_from_disk(p) for p in single]
+        return interleave_datasets(parts, stopping_strategy="all_exhausted", seed=config.seed)
+    return load_from_disk(single)
+
+
 def prepare_training_dataloader(config, collate_fn):
-    mixed_dataset = load_from_disk(config.dataset_name)
+    mixed_dataset = _load_mixed_dataset(config)
     train_dataloader = DataLoader(
         mixed_dataset,
         batch_size=config.batch_size_per_gpu,
@@ -70,13 +116,13 @@ def prepare_optimizer_and_scheduler(config, model, num_training_steps):
     return optimizer, lr_scheduler
 
 
-def save_checkpoint(accelerator, model, epoch, step, config, loss, checkpoint_dir=None):
+def save_checkpoint(accelerator, model, epoch, step, config, loss, checkpoint_dir=None, processor=None):
     if checkpoint_dir is None:
         checkpoint_dir = f"{config.output_dir}/checkpoint-{step}"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     if config.use_lora and config.save_lora_adapter_when_checkpointing:
-        save_lora_adapter(accelerator, model, checkpoint_dir)
+        save_lora_adapter(accelerator, model, checkpoint_dir, processor=processor)
 
     training_info = {
         "epoch": epoch,
@@ -96,13 +142,20 @@ def load_checkpoint(accelerator, checkpoint_dir):
     accelerator.load_state(checkpoint_dir)
 
 
-def save_lora_adapter(accelerator, model, path):
+def save_lora_adapter(accelerator, model, path, processor=None):
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.save_pretrained(
         path,
         is_main_process=accelerator.is_main_process,
         save_function=accelerator.save,
     )
+    # Persist tokenizer/processor alongside weights so that newly-added special
+    # tokens (e.g. ``<loc_*>``) survive into inference. No-op if processor is None.
+    if processor is not None and accelerator.is_main_process:
+        try:
+            processor.save_pretrained(path)
+        except Exception as exc:
+            print(f"[save_lora_adapter] processor.save_pretrained failed: {exc}")
 
 
 def write_log_to_json(log_data, step, file_path=None):

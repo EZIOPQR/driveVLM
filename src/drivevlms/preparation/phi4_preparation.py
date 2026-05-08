@@ -92,6 +92,32 @@ def _configure_image_embed_trainability(model: torch.nn.Module, config) -> None:
             _apply_image_projection_trainable(model)
 
 
+def _add_loc_tokens(model: torch.nn.Module, processor, n: int = 112) -> int:
+    """Expand tokenizer + embedding/lm_head with `<loc_0>..<loc_{n-1}>`.
+
+    Returns the number of tokens actually added. Idempotent across resumes.
+    Must be called BEFORE LoRA / adapter activation, while embed/lm_head are still
+    plain ``nn.Embedding`` / ``nn.Linear``.
+    """
+    tokenizer = processor.tokenizer
+    new_tokens = [f"<loc_{i}>" for i in range(n)]
+    existing = set(tokenizer.get_vocab().keys())
+    to_add = [t for t in new_tokens if t not in existing]
+    if not to_add:
+        return 0
+    tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+    old_size = model.get_input_embeddings().weight.shape[0]
+    model.resize_token_embeddings(len(tokenizer))
+    with torch.no_grad():
+        emb = model.get_input_embeddings().weight
+        # Mean-init new rows from existing vocab to keep loss in a sane range.
+        mean = emb[:old_size].mean(dim=0, keepdim=True)
+        emb[old_size:] = mean
+        # Phi4 ties lm_head.weight to embed_tokens.weight; reassert tie just in case.
+        model.tie_weights()
+    return len(to_add)
+
+
 @register_prepare_model_and_processor
 def prepare_model_and_processor_phi4(config):
     processor = _load_phi4_processor(config)
@@ -152,6 +178,17 @@ def prepare_model_and_processor_phi4(config):
 
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
 
+    # Optional: expand tokenizer with <loc_k> coordinate tokens. Done BEFORE LoRA so
+    # we operate on the bare embed_tokens / lm_head (LoRA wrapping happens later via
+    # ``model.set_lora_adapter('vision')`` which only touches LLM linear projections).
+    if getattr(config, "add_loc_tokens", False):
+        n_added = _add_loc_tokens(
+            model, processor, n=getattr(config, "n_loc_tokens", 112)
+        )
+        if n_added:
+            print(f"[phi4_preparation] added {n_added} <loc_*> tokens; "
+                  f"new vocab size = {len(processor.tokenizer)}")
+
     # remove parameters irrelevant to vision tasks
     del model.model.embed_tokens_extend.audio_embed  # remove audio encoder
     for layer in model.model.layers:
@@ -181,6 +218,14 @@ def prepare_model_and_processor_phi4(config):
 
     if getattr(config, "train_llm_lora", True):
         _set_llm_adapter_trainable(model, "vision", True)
+
+    # When new <loc_*> tokens were added, the corresponding rows in ``embed_tokens`` /
+    # ``lm_head`` (tied) carry mean-init weights that the model has never been trained
+    # on. They are not LoRA targets, so we must explicitly mark the embedding layer
+    # trainable to learn them. Skip when not adding new tokens to preserve the LoRA-only
+    # training surface.
+    if getattr(config, "add_loc_tokens", False):
+        model.get_input_embeddings().weight.requires_grad = True
 
     # Cast trainable (LoRA) params to fp32 so AdamW first/second moments are fp32.
     # bf16 Adam state has only ~7-bit mantissa; sqrt(v_hat) underflows on Ada GPUs and

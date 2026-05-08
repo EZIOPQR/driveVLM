@@ -262,7 +262,8 @@ def train(args):
 
                     if global_step % config.save_steps == 0:
                         save_checkpoint(
-                            accelerator, model, epoch, global_step, config, loss.item()
+                            accelerator, model, epoch, global_step, config, loss.item(),
+                            processor=processor,
                         )
                     total_loss = torch.tensor(0.0, device=accelerator.device)
                     total_loss_count = 0
@@ -286,18 +287,24 @@ def train(args):
             config,
             float(epoch_last_loss.item()),
             checkpoint_dir=epoch_path,
+            processor=processor,
         )
-        save_lora_adapter(accelerator, model, epoch_path)
+        save_lora_adapter(accelerator, model, epoch_path, processor=processor)
 
     final_path = f"{config.output_dir}/final_model"
     if config.use_lora:
-        save_lora_adapter(accelerator, model, final_path)
+        save_lora_adapter(accelerator, model, final_path, processor=processor)
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.save_pretrained(
         final_path,
         is_main_process=accelerator.is_main_process,
         save_function=accelerator.save,
     )
+    if accelerator.is_main_process:
+        try:
+            processor.save_pretrained(final_path)
+        except Exception as exc:
+            print(f"[finetune] processor.save_pretrained failed: {exc}")
     accelerator.end_training()
 
 

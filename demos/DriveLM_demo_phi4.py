@@ -4,6 +4,16 @@ from transformers import GenerationConfig
 from PIL import Image
 import argparse
 import os
+import re
+
+_LOC_RE = re.compile(r"<loc_(\d+)>")
+_CTRL_TOKEN_RE = re.compile(r"<\|[^|>]+\|>")
+
+
+def _postprocess_generated(text: str, stride: int = 4) -> str:
+    text = _LOC_RE.sub(lambda m: f"{int(m.group(1)) * stride:.2f}", text)
+    text = _CTRL_TOKEN_RE.sub("", text)
+    return text.strip()
 
 _imgs_filename = [
     "data/DriveLM_nuScenes/nuscenes/samples/CAM_FRONT/n008-2018-09-18-12-07-26-0400__CAM_FRONT__1537287220662404.jpg",
@@ -60,7 +70,8 @@ def infer(inputs):
         generation_config=generation_config
     )
     output = output[:, input_len:]
-    results = processor.batch_decode(output, skip_special_tokens=True)
+    results = processor.batch_decode(output, skip_special_tokens=False)
+    results = [_postprocess_generated(r) for r in results]
     return results
 
 

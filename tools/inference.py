@@ -1,6 +1,7 @@
 import time
 import json
 import argparse
+import re
 from functools import partial
 
 import numpy as np
@@ -11,6 +12,17 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
 
 from drivevlms.build import build_collate_fn
+
+
+_LOC_RE = re.compile(r"<loc_(\d+)>")
+_CTRL_TOKEN_RE = re.compile(r"<\|[^|>]+\|>")
+
+
+def _postprocess_generated(text: str, stride: int = 4) -> str:
+    """Convert ``<loc_k>`` back to numeric pixel values and strip Phi-4 control tokens."""
+    text = _LOC_RE.sub(lambda m: f"{int(m.group(1)) * stride:.2f}", text)
+    text = _CTRL_TOKEN_RE.sub("", text)
+    return text.strip()
 
 
 class LatencyProfiler:
@@ -117,7 +129,8 @@ def main(args):
             generation_config=generation_config
         )
         output = output[:, input_len:]
-        results = processor.batch_decode(output, skip_special_tokens=True)
+        results = processor.batch_decode(output, skip_special_tokens=False)
+        results = [_postprocess_generated(r) for r in results]
         return results, input_len, output.shape[-1]
 
     def flatten(x):

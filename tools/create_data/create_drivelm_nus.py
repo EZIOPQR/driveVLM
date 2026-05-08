@@ -275,27 +275,27 @@ def rescale_coords(x, y, orig_size=(1600, 900), target_size=(224, 224)):
     return round(new_x, 2), round(new_y, 2)
 
 # 替换字符串中形如 <c1,CAM_FRONT_RIGHT,1116.7,432.5> 的坐标
-def replace_coords_in_text(text):
+def replace_coords_in_text(text, target_size=(224, 224)):
     pattern = r"<([^,]+),([^,]+),([0-9.]+),([0-9.]+)>"
-    
+
     def repl(match):
         name, cam, x, y = match.groups()
-        x_new, y_new = rescale_coords(float(x), float(y))
+        x_new, y_new = rescale_coords(float(x), float(y), target_size=target_size)
         return f"<{name},{cam},{x_new},{y_new}>"
-    
+
     return re.sub(pattern, repl, text)
 
 
 # 主处理函数
-def convert_coors_system(data):
+def convert_coors_system(data, target_size=(224, 224)):
     for item in data:
         qa = item.get("QA", {})
         for _, qa_list in qa.items():
             for qa_item in qa_list:
                 if "Q" in qa_item and isinstance(qa_item["Q"], str):
-                    qa_item["Q"] = replace_coords_in_text(qa_item["Q"])
+                    qa_item["Q"] = replace_coords_in_text(qa_item["Q"], target_size=target_size)
                 if "A" in qa_item and isinstance(qa_item["A"], str):
-                    qa_item["A"] = replace_coords_in_text(qa_item["A"])
+                    qa_item["A"] = replace_coords_in_text(qa_item["A"], target_size=target_size)
     return data
 
 def create_drivelm_nus(args):
@@ -309,8 +309,10 @@ def create_drivelm_nus(args):
     train_frames, val_frames = split_by_key_frame(rule_data)
 
     # convert pixel valua coordinates system
-    train_frames = convert_coors_system(train_frames)
-    val_frames = convert_coors_system(val_frames)
+    tgt = int(args.resize_tgt)
+    target_size = (tgt, tgt)
+    train_frames = convert_coors_system(train_frames, target_size=target_size)
+    val_frames = convert_coors_system(val_frames, target_size=target_size)
 
     # 将转换后的数据保存到文件中
     os.makedirs("data/DriveLM_nuScenes/refs/",exist_ok=True)
@@ -339,7 +341,7 @@ def create_drivelm_nus(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("src", type=str, default=None, help='the json file download from DriveLM-nuScenes repo website')
-    parser.add_argument("--resize_tgt", type=str, default=224, help='the pixel coordinate system to be transformed to')
+    parser.add_argument("--resize_tgt", type=int, default=224, help='the pixel coordinate system to be transformed to')
     parser.add_argument("--train_data", type=str, default='data/DriveLM_nuScenes/split/train/', help='the huggingface Dataset style data')
     parser.add_argument("--val_data", type=str, default='data/DriveLM_nuScenes/split/val/', help='the huggingface Dataset style data')
     args = parser.parse_args()

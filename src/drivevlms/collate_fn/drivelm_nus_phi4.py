@@ -2,9 +2,34 @@ from transformers import BatchFeature
 from ..registry import register_collate_fn
 from PIL import Image
 import os
+import re
 import cv2
 import numpy as np
 from drivevlms.utils.flow_io import flow_npz_path_for_image
+
+_LOC_TOKEN_N = 112
+_LOC_TOKEN_STRIDE = 4
+_TAG_RE = re.compile(r'<c(\d+),(CAM_[A-Z_]+),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)>')
+
+
+def _quant_to_loc(v, n: int = _LOC_TOKEN_N, stride: int = _LOC_TOKEN_STRIDE) -> str:
+    k = int(round(float(v) / stride))
+    if k < 0:
+        k = 0
+    elif k >= n:
+        k = n - 1
+    return f"<loc_{k}>"
+
+
+def _rewrite_coord_tags(text: str) -> str:
+    if not text or '<c' not in text:
+        return text
+
+    def repl(m):
+        cid, cam, x, y = m.groups()
+        return f"<c{cid},{cam},{_quant_to_loc(x)},{_quant_to_loc(y)}>"
+
+    return _TAG_RE.sub(repl, text)
 
 def format_prompt_phi4(instruction, input=None, include_flow_images: bool = False):
 
@@ -30,8 +55,8 @@ def format_prompt_phi4(instruction, input=None, include_flow_images: bool = Fals
             "`<c{{ID}},{{CAMERA}},{{X}},{{Y}}>`\n\n"
             "- `c{{ID}}` — sequential object handle: `c1`, `c2`, `c3`, ...\n"
             "- `{{CAMERA}}` — one of the 6 camera names above (uppercase, with underscores, no quotes)\n"
-            "- `{{X}}`, `{{Y}}` — pixel coordinates of the object center in the **224x224** image coordinate system, as floats with 2 decimal places\n\n"
-            "Example: `<c1,CAM_FRONT_RIGHT,25.06,103.09>`\n\n"
+            "- `{{X}}`, `{{Y}}` — pixel coordinates of the object center in the **448x448** image coordinate system, encoded as special location tokens. Use `<loc_k>` where `k` is an integer in `0..111` and represents the pixel value `4*k` (so `<loc_0>` = pixel 0, `<loc_25>` = pixel 100, `<loc_111>` = pixel 444).\n\n"
+            "Example: `<c1,CAM_FRONT_RIGHT,<loc_6>,<loc_25>>`\n\n"
             "## Reading rule\n"
             "When the question contains tags like `<ci,CAM_xxx,x,y>`, treat each tag as a pointer to one specific object visible in the named camera at the given pixel location. Resolve every tag to a real object before answering.\n\n"
             "## Answering rules\n"
@@ -59,8 +84,8 @@ def format_prompt_phi4(instruction, input=None, include_flow_images: bool = Fals
             "`<c{{ID}},{{CAMERA}},{{X}},{{Y}}>`\n\n"
             "- `c{{ID}}` — sequential object handle: `c1`, `c2`, `c3`, ...\n"
             "- `{{CAMERA}}` — one of the 6 camera names above (uppercase, with underscores, no quotes)\n"
-            "- `{{X}}`, `{{Y}}` — pixel coordinates of the object center in the **224x224** image coordinate system, as floats with 2 decimal places\n\n"
-            "Example: `<c1,CAM_FRONT_RIGHT,25.06,103.09>`\n\n"
+            "- `{{X}}`, `{{Y}}` — pixel coordinates of the object center in the **448x448** image coordinate system, encoded as special location tokens. Use `<loc_k>` where `k` is an integer in `0..111` and represents the pixel value `4*k` (so `<loc_0>` = pixel 0, `<loc_25>` = pixel 100, `<loc_111>` = pixel 444).\n\n"
+            "Example: `<c1,CAM_FRONT_RIGHT,<loc_6>,<loc_25>>`\n\n"
             "## Reading rule\n"
             "When the question contains tags like `<ci,CAM_xxx,x,y>`, treat each tag as a pointer to one specific object visible in the named camera at the given pixel location. Resolve every tag to a real object before answering.\n\n"
             "## Answering rules\n"
@@ -179,12 +204,12 @@ def drivelm_nus_phi4_collate_fn(
 ):
     prompts = [
         format_prompt_phi4(
-            example["conversations"][0]['value'],
+            _rewrite_coord_tags(example["conversations"][0]['value']),
             include_flow_images=bool(use_optical_flow and flow_root),
         )
         for example in examples
     ]
-    answers = [format_answer(example["conversations"][1]['value']) for example in examples]
+    answers = [format_answer(_rewrite_coord_tags(example["conversations"][1]['value'])) for example in examples]
     images = []
     for example in examples:
         rgb_images = [Image.open(example["image_paths"][i]).convert("RGB") for i in range(6)]
@@ -251,7 +276,7 @@ def drivelm_nus_phi4_collate_fn_val(
     questions = [example["conversations"][0]['value'] for example in examples]
     prompts = [
         format_prompt_phi4(
-            example["conversations"][0]['value'],
+            _rewrite_coord_tags(example["conversations"][0]['value']),
             include_flow_images=bool(use_optical_flow and flow_root),
         )
         for example in examples
