@@ -10,13 +10,16 @@ import sys
 sys.path.append(".")
 
 class evaluation_suit():
-    def __init__(self):
+    def __init__(self, pred_to_gt_scale: float = 1.0):
         self.language_eval = language_evaluation.CocoEvaluator(coco_types=["BLEU", "ROUGE_L", "CIDEr"])
         # self.chatgpt_eval = GPTEvaluation()
         # self.GPT = []
         self.accuracy = {"answer": [], "GT": []}
         self.language = {"answer": [], "GT": []}
         self.match = {"match": {"answer": [], "GT": []}, "GPT": []}
+        # Ratio applied to prediction coord numbers before matching against GT.
+        # E.g. predictions in 224-space vs GT in 448-space -> 2.0.
+        self.pred_to_gt_scale = float(pred_to_gt_scale)
 
     def eval_acc(self):
         scores = []
@@ -90,6 +93,10 @@ class evaluation_suit():
             answer_nums = answer_nums[:-1]
         answer_nums = np.array([list(map(float, x.split()))[0] for x in answer_nums]).reshape(-1, 2)
         GT_nums = np.array([list(map(float, x.split()))[0] for x in GT_nums]).reshape(-1, 2)
+        # Rescale prediction coords into GT coord space when the two were
+        # produced in different pixel spaces (e.g. 224 vs 448).
+        if self.pred_to_gt_scale != 1.0 and len(answer_nums):
+            answer_nums = answer_nums * self.pred_to_gt_scale
         length = len(GT_nums)
 
         matched_out = []
@@ -107,10 +114,10 @@ class evaluation_suit():
                     closest_gt = gt
                     closest_id = i
 
-            if closest_distance < 16:
+            if closest_distance < 16 * self.pred_to_gt_scale:
                 true_positives += 1
-                matched_out.append(closest_gt)  
-                GT_nums = np.delete(GT_nums, closest_id, axis=0) 
+                matched_out.append(closest_gt)
+                GT_nums = np.delete(GT_nums, closest_id, axis=0)
             else:
                 false_positives += 1
             
@@ -163,15 +170,27 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Evaluation')
     parser.add_argument('--src', type=str, default="data/DriveLM_nuScenes/refs/infer_results.json", help='path to prediction file')
     parser.add_argument('--tgt', type=str, default="data/DriveLM_nuScenes/refs/val_cot.json", help='path to test file')
+    parser.add_argument('--pred_coord_space', type=int, default=448,
+                        help='Pixel coordinate space the PREDICTION JSON uses '
+                             '(default 448, matching the current GT). Set to 224 '
+                             'when evaluating older inference results that were '
+                             'produced before the 448-space migration.')
+    parser.add_argument('--gt_coord_space', type=int, default=448,
+                        help='Pixel coordinate space the GT JSON uses (default 448).')
     args = parser.parse_args()
-    
-    with open(args.src, 'r') as f :#, \    
+
+    pred_to_gt_scale = args.gt_coord_space / args.pred_coord_space
+    if pred_to_gt_scale != 1.0:
+        print(f"[eval] rescaling predicted coords by {pred_to_gt_scale:.4f}x "
+              f"(pred space={args.pred_coord_space}, gt space={args.gt_coord_space})")
+
+    with open(args.src, 'r') as f :#, \
         pred_file = json.load(f)
     pred_file = {pred_file[i]["id"]: pred_file[i] for i in range(len(pred_file))}
-    
+
     with open(args.tgt, 'r') as f:
         test_file = json.load(f)
-    evaluation = evaluation_suit()
+    evaluation = evaluation_suit(pred_to_gt_scale=pred_to_gt_scale)
     for frame_data in test_file:
         first_flag = True
         frame_data_qa = frame_data['QA']

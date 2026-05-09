@@ -83,25 +83,27 @@ def _load_mixed_dataset(config):
         probs = [w / s for w in weights]
         parts = [load_from_disk(p) for p in paths]
         return interleave_datasets(
-            parts, probabilities=probs, stopping_strategy="all_exhausted", seed=config.seed
+            parts, probabilities=probs, stopping_strategy="first_exhausted", seed=config.seed
         )
 
     single = config.dataset_name
     if isinstance(single, (list, tuple)):
         parts = [load_from_disk(p) for p in single]
-        return interleave_datasets(parts, stopping_strategy="all_exhausted", seed=config.seed)
+        return interleave_datasets(parts, stopping_strategy="first_exhausted", seed=config.seed)
     return load_from_disk(single)
 
 
 def prepare_training_dataloader(config, collate_fn):
     mixed_dataset = _load_mixed_dataset(config)
+    num_workers = int(getattr(config, "dataloader_num_workers", 4))
     train_dataloader = DataLoader(
         mixed_dataset,
         batch_size=config.batch_size_per_gpu,
         collate_fn=collate_fn,
         shuffle=True,
-        num_workers=16,
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
     return train_dataloader
 

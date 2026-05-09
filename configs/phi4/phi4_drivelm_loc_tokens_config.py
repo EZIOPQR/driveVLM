@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 
 def _default_dataset_mix() -> List[Tuple[str, float]]:
     return [
-        ("data/DriveLM_nuScenes/split_448/train", 0.7),
-        ("data/nus_detection_qa/split/train",     0.3),
+        ("data/DriveLM_nuScenes/split_448/train",                  0.6),
+        ("/root/autodl-tmp/nus_detection_qa/split_local/train",    0.4),
     ]
 
 
@@ -36,7 +36,7 @@ class DriveLMNusPhi4LocTokensConfig:
     run_name: str = f"LOC-{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
     output_dir: str = "/root/autodl-tmp/pretrained/phi4/" + f"{run_name}"
 
-    num_train_epochs: int = 1
+    num_train_epochs: int = 3
     batch_size_per_gpu: int = 1
     gradient_accumulation_steps: int = 8
     lr: float = 5e-6
@@ -61,6 +61,12 @@ class DriveLMNusPhi4LocTokensConfig:
     save_steps: int = 99999
     log_steps: int = 10
     print_steps: int = 10
+
+    # DataLoader workers per rank. With 8 GPUs the previous hardcoded 16 spawned
+    # 8*16=128 worker processes; on autodl containers that hits rayon (HF
+    # ``tokenizers``) thread-pool init failures (``Resource temporarily
+    # unavailable``). 2-4 is plenty for image jpg loading.
+    dataloader_num_workers: int = 4
 
     find_unused_parameters: bool = True
 

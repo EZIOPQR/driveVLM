@@ -10,6 +10,8 @@ working without changes:
 """
 import argparse
 import json
+import os
+import re
 from functools import partial
 
 import torch
@@ -21,10 +23,48 @@ from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
 from drivevlms.build import build_collate_fn
 
 
+_LOC_RE = re.compile(r"<loc_(\d+)>")
+_CTRL_TOKEN_RE = re.compile(r"<\|[^|>]+\|>")
+
+
+def _postprocess_generated(text: str, stride: int = 4) -> str:
+    """Convert ``<loc_k>`` back to numeric pixel values and strip Phi-4 control tokens."""
+    text = _LOC_RE.sub(lambda m: f"{int(m.group(1)) * stride:.2f}", text)
+    text = _CTRL_TOKEN_RE.sub("", text)
+    return text.strip()
+
+
 @torch.no_grad()
 def main(args):
-    base_model = "/root/autodl-tmp/models/Phi-4-multimodal-instruct"
-    processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=True)
+    # Strategy:
+    # - Always load the processor (image + audio + tokenizer) from the BASE Phi-4
+    #   path, because the fine-tuned checkpoint serialized an older
+    #   ``preprocessor_config.json`` whose audio fields no longer match the current
+    #   ``Phi4MMAudioFeatureExtractor.__init__`` signature.
+    # - Then OVERLAY the tokenizer from the checkpoint (or --processor) so the
+    #   added <loc_*> tokens come through.
+    BASE = "/root/autodl-tmp/models/Phi-4-multimodal-instruct"
+    if args.processor:
+        tokenizer_src = args.processor
+    elif os.path.isfile(os.path.join(args.model, "tokenizer.json")) \
+            or os.path.isfile(os.path.join(args.model, "added_tokens.json")):
+        tokenizer_src = args.model
+    else:
+        tokenizer_src = BASE
+    print(f"[inference_batch] processor base = {BASE}")
+    print(f"[inference_batch] tokenizer src  = {tokenizer_src}")
+
+    processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
+    if tokenizer_src != BASE:
+        from transformers import AutoTokenizer
+        processor.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_src, trust_remote_code=True
+        )
+        print(f"[inference_batch] tokenizer vocab size = {len(processor.tokenizer)}")
+        # Sanity: confirm <loc_*> are atomic single tokens
+        sample_toks = processor.tokenizer.tokenize("<loc_30>")
+        print(f"[inference_batch] tokenize('<loc_30>') -> {sample_toks}")
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
@@ -33,7 +73,7 @@ def main(args):
     )
     model.to(args.device)
     model.eval()
-    generation_config = GenerationConfig.from_pretrained(base_model)
+    generation_config = GenerationConfig.from_pretrained(BASE)
 
     collate_fn = build_collate_fn(args.collate_fn)
     val_collate_fn = partial(
@@ -76,7 +116,9 @@ def main(args):
         )
         # Same input_len for every sample in batch (left padding aligns them).
         output = output[:, input_len:]
-        answers = processor.batch_decode(output, skip_special_tokens=True)
+        # Keep <loc_*> in the decoded text, then post-process to numeric coords.
+        answers = processor.batch_decode(output, skip_special_tokens=False)
+        answers = [_postprocess_generated(a) for a in answers]
 
         assert len(answers) == len(ids) == len(questions), (
             f"len mismatch: answers={len(answers)} ids={len(ids)} questions={len(questions)}"
@@ -104,6 +146,12 @@ def parse_args():
         "--model", type=str,
         default="/root/autodl-tmp/models/Phi-4-multimodal-instruct",
         help="Path to model or fine-tuned checkpoint",
+    )
+    parser.add_argument(
+        "--processor", type=str, default=None,
+        help="Path to processor/tokenizer dir. If unset, uses --model when it has "
+             "tokenizer files (recommended for loc-tokens checkpoints), else falls "
+             "back to the base Phi-4 path.",
     )
     parser.add_argument("--device", default="cuda", help="Device to run inference")
     parser.add_argument(
