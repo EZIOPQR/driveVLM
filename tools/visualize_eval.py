@@ -6,6 +6,9 @@ Per-sample scoring:
 - tag=3 (object coords)        -> match-F1 (same logic as tools/evaluation.py)
 - tag=1 (planning)             -> dropped (no auto score in evaluation.py either)
 
+A single QA can belong to multiple tag buckets; it contributes to every bucket
+whose tag appears in ``qa["tag"]`` (mirroring evaluation_suit.forward).
+
 Output (per --src):
     {out}/{src_basename}.html
 
@@ -14,8 +17,8 @@ Image references are written relative to a `DriveLM_nuScenes/` root
 local `DriveLM_nuScenes/` folder (the one containing `nuscenes/samples/...`)
 and open in a browser. No thumbnails are generated; original full-res images
 are referenced directly and lazily loaded. When GT/pred contain
-`<c*,CAM_*,x,y>` tags, green (GT) and orange (prediction) markers with 224-space
-coordinates are drawn on the matching camera thumbnails after expanding a card.
+`<c*,CAM_*,x,y>` tags, green (GT) and orange (prediction) markers are drawn
+on the matching camera thumbnails after expanding a card.
 
 Usage:
     python tools/visualize_eval.py \\
@@ -45,12 +48,21 @@ _OBJ_TAG_PARSE_RE = re.compile(
 # evaluation.py keeps only floats with explicit decimal, mirror it for parity.
 _FLOAT_RE = re.compile(r"\d+\.\d+")
 
-# Coordinates in *_cot.json are expressed in this square grid (see create_drivelm_nus.rescale_coords).
-OVERLAY_COORD_SPACE = 224
+# Coordinates GT/pred spaces are CLI-driven; defaults match evaluation.py.
+DEFAULT_GT_COORD_SPACE = 448
+DEFAULT_PRED_COORD_SPACE = 448
+# L1 distance threshold in the canonical 224x224 DriveLM coord space. Scaled at
+# runtime to whatever space the GT currently lives in (same rule as evaluation.py).
+_BASE_MATCH_THRESHOLD_224 = 16.0
 
 
 def rouge_l_f1(pred: str, gt: str) -> float:
-    """LCS-based single-sentence ROUGE-L F1."""
+    """LCS-based single-sentence ROUGE-L F1.
+
+    Kept for per-sample colour badges only; it is NOT used to aggregate the
+    tag=2 bucket score — that number comes from language_evaluation.CocoEvaluator,
+    the same corpus-level library evaluation.py uses.
+    """
     p_toks = pred.lower().split()
     g_toks = gt.lower().split()
     if not p_toks or not g_toks:
@@ -104,18 +116,28 @@ def coord_pairs(text: str) -> list[tuple[float, float]]:
     return [(float(nums[i]), float(nums[i + 1])) for i in range(0, len(nums), 2)]
 
 
-def coord_match(pred: str, gt: str, threshold: float = 16.0):
+def coord_match(pred: str, gt: str,
+                *, threshold: float, pred_to_gt_scale: float = 1.0):
     """Greedy nearest-neighbour match (L1 distance), mirroring evaluation.match_result.
+
+    - ``pred`` coords are pre-scaled by ``pred_to_gt_scale`` (e.g. 0.5 when pred
+      is 448-space and GT is 224-space), then matched to GT coords.
+    - ``threshold`` is expressed in GT pixel space.
 
     Returns:
         f1: float in [0, 1]
         matched: list of {gt_idx, pred_idx, dist}
         missed: list of unmatched gt indices
         extra:  list of unmatched pred indices
-        gt_pairs / pred_pairs
+        gt_pairs / pred_pairs (both in GT coord space)
     """
     gt_pairs = coord_pairs(gt)
-    pred_pairs = coord_pairs(pred)
+    pred_pairs_raw = coord_pairs(pred)
+    if pred_to_gt_scale != 1.0:
+        pred_pairs = [(x * pred_to_gt_scale, y * pred_to_gt_scale)
+                      for x, y in pred_pairs_raw]
+    else:
+        pred_pairs = list(pred_pairs_raw)
     remaining = list(range(len(gt_pairs)))
     matched, extra = [], []
     for pi, p in enumerate(pred_pairs):
@@ -138,14 +160,21 @@ def coord_match(pred: str, gt: str, threshold: float = 16.0):
     return f1, matched, missed, extra, gt_pairs, pred_pairs
 
 
-def score_one(tag: int, pred: str, gt: str):
-    """Returns (score in [0,1], extra dict for tag=3 coord render)."""
+def score_one(tag: int, pred: str, gt: str,
+              *, threshold: float, pred_to_gt_scale: float):
+    """Returns (score in [0,1] or None, extra dict for tag=3 coord render).
+
+    tag=2 (language) gets no per-sample score here; the aggregate is computed
+    at summary time via language_evaluation.CocoEvaluator.
+    """
     if tag == 0:
         return (1.0 if pred.strip() == gt.strip() else 0.0), None
     if tag == 2:
-        return rouge_l_f1(pred, gt), None
+        return None, None
     if tag == 3:
-        f1, matched, missed, extra, gt_pairs, pred_pairs = coord_match(pred, gt)
+        f1, matched, missed, extra, gt_pairs, pred_pairs = coord_match(
+            pred, gt, threshold=threshold, pred_to_gt_scale=pred_to_gt_scale,
+        )
         return f1, {
             "matched": matched,
             "missed": missed,
@@ -156,8 +185,13 @@ def score_one(tag: int, pred: str, gt: str):
     raise ValueError(f"unsupported tag {tag}")
 
 
-def score_bucket(tag: int, score: float) -> str:
-    """correct / partial / wrong (drives the colour badge)."""
+def score_bucket(tag: int, score) -> str:
+    """correct / partial / wrong (drives the colour badge).
+
+    tag=2 has no per-sample score; return ``na`` so the HTML can dim the badge.
+    """
+    if score is None:
+        return "na"
     if tag == 0:
         return "correct" if score == 1.0 else "wrong"
     if score >= 0.8:
@@ -229,12 +263,18 @@ def to_img_src(image_path: str) -> str:
     return image_path
 
 
-def _build_graph(pred: str, gt: str) -> list[list[float]]:
+def _build_graph(pred: str, gt: str, *, threshold: float,
+                 pred_to_gt_scale: float = 1.0) -> list[list[float]]:
     """Mirrors evaluation_suit.set_graph: return matched GT coord pairs."""
     if isinstance(pred, list):
         pred = pred[0]
     gt_pairs = coord_pairs(gt)
-    pred_pairs = coord_pairs(pred)
+    pred_pairs_raw = coord_pairs(pred)
+    if pred_to_gt_scale != 1.0:
+        pred_pairs = [(x * pred_to_gt_scale, y * pred_to_gt_scale)
+                      for x, y in pred_pairs_raw]
+    else:
+        pred_pairs = list(pred_pairs_raw)
     remaining = list(range(len(gt_pairs)))
     matched_gt: list[list[float]] = []
     for p in pred_pairs:
@@ -244,7 +284,7 @@ def _build_graph(pred: str, gt: str) -> list[list[float]]:
             d = abs(p[0] - g[0]) + abs(p[1] - g[1])
             if d < best_d:
                 best_gi, best_d = gi, d
-        if best_gi is not None and best_d < 16:
+        if best_gi is not None and best_d < threshold:
             matched_gt.append([gt_pairs[best_gi][0], gt_pairs[best_gi][1]])
             remaining.remove(best_gi)
     return matched_gt
@@ -262,8 +302,13 @@ def _eval_graph(question: str, graph: list[list[float]]) -> bool:
     return True
 
 
-def load_aligned(src_path: str, gt_path: str):
-    """Return list of dicts: id, scene_id, frame_id, qa_idx, tag, question, gt, pred, image_paths."""
+def load_aligned(src_path: str, gt_path: str, *,
+                 threshold: float, pred_to_gt_scale: float):
+    """Return list of dicts: id, scene_id, frame_id, qa_idx, tag, question, gt, pred, image_paths.
+
+    A QA whose ``tag`` list has multiple scored tags (e.g. ``[0, 3]``) is emitted
+    once per bucket to mirror evaluation_suit.forward's per-bucket accounting.
+    """
     with open(src_path) as f:
         pred_list = json.load(f)
     pred_by_id = {r["id"]: r for r in pred_list}
@@ -296,26 +341,31 @@ def load_aligned(src_path: str, gt_path: str):
 
             if first_flag:
                 first_flag = False
-                graph = _build_graph(pred_answer, gt_answer)
+                graph = _build_graph(
+                    pred_answer, gt_answer,
+                    threshold=threshold,
+                    pred_to_gt_scale=pred_to_gt_scale,
+                )
             else:
                 if not _eval_graph(qa["Q"], graph):
                     continue
 
-            if not (0 in tag_list or 2 in tag_list or 3 in tag_list):
+            scored_tags = [t for t in (0, 2, 3) if t in tag_list]
+            if not scored_tags:
                 continue
 
-            tag = 0 if 0 in tag_list else (2 if 2 in tag_list else 3)
-            out.append({
-                "id": sid,
-                "scene_id": scene_id,
-                "frame_id": frame_id,
-                "qa_idx": i,
-                "tag": tag,
-                "question": qa["Q"],
-                "gt": gt_answer,
-                "pred": pred_answer,
-                "image_paths": image_paths,
-            })
+            for tag in scored_tags:
+                out.append({
+                    "id": f"{sid}_t{tag}" if len(scored_tags) > 1 else sid,
+                    "scene_id": scene_id,
+                    "frame_id": frame_id,
+                    "qa_idx": i,
+                    "tag": tag,
+                    "question": qa["Q"],
+                    "gt": gt_answer,
+                    "pred": pred_answer,
+                    "image_paths": image_paths,
+                })
     return out
 
 
@@ -550,8 +600,9 @@ function applyFilters(){
               r.id.toLowerCase().includes(q))) return false;
     return true;
   });
-  if(state.sort === "score_asc") view.sort((a,b) => a.score - b.score);
-  else if(state.sort === "score_desc") view.sort((a,b) => b.score - a.score);
+  const scoreOf = r => r.score === null || r.score === undefined ? Infinity : r.score;
+  if(state.sort === "score_asc") view.sort((a,b) => scoreOf(a) - scoreOf(b));
+  else if(state.sort === "score_desc") view.sort((a,b) => scoreOf(b) - scoreOf(a));
   else view.sort((a,b) => a.id.localeCompare(b.id));
   state.page = 1;
   render();
@@ -561,7 +612,7 @@ function renderCard(r){
   const head = `
     <div class="head">
       <span class="badge tag">tag${r.tag}</span>
-      <span class="badge score ${r.score_bucket}">${r.score_bucket} ${r.score.toFixed(2)}</span>
+      <span class="badge score ${r.score_bucket}">${r.score_bucket}${r.score !== null && r.score !== undefined ? ' ' + r.score.toFixed(2) : ''}</span>
       <span class="id">${escapeHtml(r.id)}</span>
       <div class="preview"><span class="label">Q:</span>${escapeHtml(r.question)}</div>
       <div class="preview"><span class="label">GT:</span>${escapeHtml(r.gt)}</div>
@@ -744,11 +795,15 @@ applyFilters();
 """
 
 
-def build_records(aligned):
+def build_records(aligned, *, threshold: float, pred_to_gt_scale: float):
     """Add score / score_bucket / diff marks / coord match info."""
     out = []
     for r in aligned:
-        score, extra = score_one(r["tag"], r["pred"], r["gt"])
+        score, extra = score_one(
+            r["tag"], r["pred"], r["gt"],
+            threshold=threshold,
+            pred_to_gt_scale=pred_to_gt_scale,
+        )
         bucket = score_bucket(r["tag"], score)
         rec = {
             "id": r["id"],
@@ -756,7 +811,7 @@ def build_records(aligned):
             "frame_id": r["frame_id"],
             "qa_idx": r["qa_idx"],
             "tag": r["tag"],
-            "score": round(score, 4),
+            "score": round(score, 4) if score is not None else None,
             "score_bucket": bucket,
             "question": r["question"],
             "gt": r["gt"],
@@ -775,28 +830,32 @@ def build_records(aligned):
         if cam_ov:
             rec["cam_overlay"] = cam_ov
         out.append(rec)
-    out.sort(key=lambda x: x["score"])  # worst first
+    # Worst-scored first; tag=2 records (score=None) sink to the end.
+    out.sort(key=lambda x: (x["score"] is None, x["score"] if x["score"] is not None else 0))
     return out
 
 
 def build_summary(records, src_name: str):
-    by_tag = {0: [], 2: [], 3: []}
-    tag2_preds: list[str] = []
-    tag2_gts: list[str] = []
+    by_tag_scores = {0: [], 3: []}
+    tag2_records: list[dict] = []
     for r in records:
-        by_tag[r["tag"]].append(r["score"])
         if r["tag"] == 2:
-            tag2_preds.append(r["pred"])
-            tag2_gts.append(r["gt"])
+            tag2_records.append(r)
+        elif r["tag"] in by_tag_scores:
+            by_tag_scores[r["tag"]].append(r["score"])
 
     def avg(xs):
         return round(sum(xs) / len(xs), 4) if xs else None
 
     # Corpus-level language score (same as evaluation.py)
     tag2_score = None
-    if tag2_preds:
+    tag2_raw = None
+    if tag2_records:
+        preds = [r["pred"] for r in tag2_records]
+        gts = [r["gt"] for r in tag2_records]
         coco_eval = language_evaluation.CocoEvaluator(coco_types=["BLEU", "ROUGE_L", "CIDEr"])
-        results_gen = coco_eval.run_evaluation(tag2_preds, tag2_gts)
+        results_gen = coco_eval.run_evaluation(preds, gts)
+        tag2_raw = {k: round(float(v), 4) for k, v in results_gen.items()}
         score = 0.0
         for idx, key in enumerate(results_gen.keys()):
             if idx < 4:
@@ -810,9 +869,9 @@ def build_summary(records, src_name: str):
     return {
         "src_name": src_name,
         "n_total": len(records),
-        "tag0": {"n": len(by_tag[0]), "accuracy": avg(by_tag[0])},
-        "tag2": {"n": len(by_tag[2]), "language": tag2_score},
-        "tag3": {"n": len(by_tag[3]), "f1_mean": avg(by_tag[3])},
+        "tag0": {"n": len(by_tag_scores[0]), "accuracy": avg(by_tag_scores[0])},
+        "tag2": {"n": len(tag2_records), "language": tag2_score, "raw": tag2_raw},
+        "tag3": {"n": len(by_tag_scores[3]), "f1_mean": avg(by_tag_scores[3])},
     }
 
 
@@ -820,7 +879,7 @@ def fmt_metric(x):
     return f"{x:.3f}" if isinstance(x, float) else "n/a"
 
 
-def render_html(records, summary) -> str:
+def render_html(records, summary, *, overlay_coord_space: int) -> str:
     html = HTML_SHELL
     html = html.replace("__TITLE__", summary["src_name"])
     html = html.replace("__SRC_NAME__", summary["src_name"])
@@ -831,7 +890,7 @@ def render_html(records, summary) -> str:
     html = html.replace("__RECORDS_JSON__",
                         json.dumps(records, ensure_ascii=False, separators=(",", ":")))
     html = html.replace("__CAM_NAMES__", json.dumps(CAM_NAMES))
-    html = html.replace("__OVERLAY_COORD_SPACE__", str(OVERLAY_COORD_SPACE))
+    html = html.replace("__OVERLAY_COORD_SPACE__", str(overlay_coord_space))
     return html
 
 
@@ -849,25 +908,44 @@ def main():
                     help="output dir; will write {out}/{src_basename}.html")
     ap.add_argument("--limit", type=int, default=None,
                     help="for debug: only keep first N aligned records")
+    ap.add_argument("--pred_coord_space", type=int, default=DEFAULT_PRED_COORD_SPACE,
+                    help="pixel coord space used by the prediction JSON (default 448)")
+    ap.add_argument("--gt_coord_space", type=int, default=DEFAULT_GT_COORD_SPACE,
+                    help="pixel coord space used by the GT JSON (default 448)")
     args = ap.parse_args()
 
     src_name = Path(args.src).stem
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    pred_to_gt_scale = args.gt_coord_space / args.pred_coord_space
+    threshold = _BASE_MATCH_THRESHOLD_224 * args.gt_coord_space / 224.0
+    print(f"[viz] match threshold (L1, GT coord space): {threshold:.2f}")
+    if pred_to_gt_scale != 1.0:
+        print(f"[viz] rescaling predicted coords by {pred_to_gt_scale:.4f}x "
+              f"(pred space={args.pred_coord_space}, gt space={args.gt_coord_space})")
+
     print(f"[viz] loading {args.src}")
-    aligned = load_aligned(args.src, args.gt)
+    aligned = load_aligned(
+        args.src, args.gt,
+        threshold=threshold,
+        pred_to_gt_scale=pred_to_gt_scale,
+    )
     print(f"[viz] aligned records (tag in 0/2/3): {len(aligned)}")
     if args.limit:
         aligned = aligned[: args.limit]
         print(f"[viz] --limit -> {len(aligned)}")
 
     print("[viz] scoring & building records")
-    records = build_records(aligned)
+    records = build_records(
+        aligned,
+        threshold=threshold,
+        pred_to_gt_scale=pred_to_gt_scale,
+    )
     summary = build_summary(records, src_name)
     print(f"[viz] summary: {summary}")
 
-    html = render_html(records, summary)
+    html = render_html(records, summary, overlay_coord_space=args.gt_coord_space)
     report_path = out_dir / f"{src_name}.html"
     report_path.write_text(html, encoding="utf-8")
     size_mb = report_path.stat().st_size / 1024 / 1024

@@ -10,7 +10,11 @@ import sys
 sys.path.append(".")
 
 class evaluation_suit():
-    def __init__(self, pred_to_gt_scale: float = 1.0):
+    # L1 distance threshold in the canonical 224x224 DriveLM coord space. Scaled
+    # at runtime to whatever space the GT currently lives in (e.g. 32 for 448).
+    _BASE_MATCH_THRESHOLD_224 = 16.0
+
+    def __init__(self, pred_to_gt_scale: float = 1.0, gt_coord_space: int = 224):
         self.language_eval = language_evaluation.CocoEvaluator(coco_types=["BLEU", "ROUGE_L", "CIDEr"])
         # self.chatgpt_eval = GPTEvaluation()
         # self.GPT = []
@@ -20,6 +24,8 @@ class evaluation_suit():
         # Ratio applied to prediction coord numbers before matching against GT.
         # E.g. predictions in 224-space vs GT in 448-space -> 2.0.
         self.pred_to_gt_scale = float(pred_to_gt_scale)
+        # Match threshold in the GT coord space. 16px in 224 -> 32px in 448.
+        self.match_threshold = self._BASE_MATCH_THRESHOLD_224 * gt_coord_space / 224.0
 
     def eval_acc(self):
         scores = []
@@ -114,7 +120,7 @@ class evaluation_suit():
                     closest_gt = gt
                     closest_id = i
 
-            if closest_distance < 16 * self.pred_to_gt_scale:
+            if closest_distance < self.match_threshold:
                 true_positives += 1
                 matched_out.append(closest_gt)
                 GT_nums = np.delete(GT_nums, closest_id, axis=0)
@@ -152,6 +158,7 @@ class evaluation_suit():
             
     def evaluation(self):
         print("evaluation start!")
+        print(f"match threshold (L1, GT coord space): {self.match_threshold:.2f}")
         print(
             f"bucket sizes: accuracy(tag=0)={len(self.accuracy['answer'])}, "
             f"language(tag=2)={len(self.language['answer'])}, "
@@ -190,7 +197,10 @@ if __name__ == '__main__':
 
     with open(args.tgt, 'r') as f:
         test_file = json.load(f)
-    evaluation = evaluation_suit(pred_to_gt_scale=pred_to_gt_scale)
+    evaluation = evaluation_suit(
+        pred_to_gt_scale=pred_to_gt_scale,
+        gt_coord_space=args.gt_coord_space,
+    )
     for frame_data in test_file:
         first_flag = True
         frame_data_qa = frame_data['QA']

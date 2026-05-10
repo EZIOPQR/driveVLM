@@ -132,7 +132,7 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DriveLM Batched Inference (Phi-4)")
-    parser.add_argument("--data", type=str, default="data/DriveLM_nuScenes/split/val")
+    parser.add_argument("--data", type=str, default="data/DriveLM_nuScenes/split_448/val")
     parser.add_argument(
         "--collate_fn", type=str, default="drivelm_nus_phi4_collate_fn_val",
         help="Must point at a val collate fn that supports batch>1. "
