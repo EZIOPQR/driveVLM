@@ -45,7 +45,7 @@ _OBJ_TAG_PARSE_RE = re.compile(
 CAM_NAMES = ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
              "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
 
-_IMG_STRIP_PREFIX = "data/DriveLM_nuScenes/"
+_IMG_STRIP_PREFIX = "data/DriveLM_nuScenes/"  # kept for backwards compatibility; unused.
 
 # Built-in categories tracked for filters / histograms; extended automatically when
 # the question mentions an unknown category.
@@ -56,9 +56,19 @@ _PLURAL_TO_SINGULAR = {
 }
 
 
+_SAMPLES_SEG = "/samples/"
+
+
 def to_img_src(image_path: str) -> str:
-    if image_path.startswith(_IMG_STRIP_PREFIX):
-        return image_path[len(_IMG_STRIP_PREFIX):]
+    """Return a path relative to the nuScenes ``samples/`` directory.
+
+    Assumes the rendered HTML lives inside ``samples/`` (or a sibling served
+    from the same parent), so ``CAM_X/foo.jpg`` resolves without a server
+    root mapping.
+    """
+    idx = image_path.rfind(_SAMPLES_SEG)
+    if idx != -1:
+        return image_path[idx + len(_SAMPLES_SEG):]
     return image_path
 
 
@@ -522,7 +532,8 @@ def main():
     ap.add_argument("--src", required=True,
                     help="HF Dataset directory produced by create_nus_detection_qa.py "
                          "(e.g. data/nus_detection_qa/split/train)")
-    ap.add_argument("--out", default="viz_eval/", help="output dir")
+    ap.add_argument("--out", default="/data/dataset/nuscenes/samples",
+                    help="output dir; must sit next to CAM_* so relative image paths resolve")
     ap.add_argument("--limit", type=int, default=None,
                     help="cap number of samples (useful for huge train splits)")
     ap.add_argument("--coord-space", type=int, default=448,

@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 
 def _default_dataset_mix() -> List[Tuple[str, float]]:
     return [
-        ("data/DriveLM_nuScenes/split_448/train",                  0.6),
-        ("/root/autodl-tmp/nus_detection_qa/split_local/train",    0.4),
+        ("data/DriveLM_nuScenes/split_448/train",        0.6),
+        ("data/nus_detection_qa/split/train",            0.4),
     ]
 
 
@@ -17,10 +17,14 @@ class DriveLMNusPhi4LocTokensConfig:
     # often absent there, so ``processor_model_name`` should point to a directory with
     # tokenizer/processor files (or a previous ``--add_loc_tokens`` run that already saved
     # the expanded tokenizer alongside its weights).
-    model_name: str = "/root/autodl-tmp/pretrained/phi4/FULL-2026-05-03_02-39/final_model"
-    # If you re-run training with the same loc_tokens config, point this at the prior
-    # output dir so the expanded tokenizer is reused.
-    processor_model_name: str = "/root/autodl-tmp/models/Phi-4-multimodal-instruct"
+    model_name: str = "/data/ckpt/pretrained/phi4/LOC-2026-05-08_23-22/epoch-3"
+    # Load processor (image + audio + tokenizer) from the BASE Phi-4 path because
+    # the fine-tuned checkpoint serialized an older preprocessor_config.json whose
+    # audio fields no longer match Phi4MMAudioFeatureExtractor.__init__. The
+    # tokenizer is then extended via add_loc_tokens; since the checkpoint already
+    # has 200141 rows in its embed_tokens, resize_token_embeddings is a no-op and
+    # the trained <loc_*> embeddings are preserved intact.
+    processor_model_name: str = "/data/huggingface/Phi-4-multimodal-instruct"
     model_preparation: str = "prepare_model_and_processor_phi4"
     collate_fn_train: str = "drivelm_nus_phi4_collate_fn"
     collate_fn_val: str = None
@@ -33,19 +37,19 @@ class DriveLMNusPhi4LocTokensConfig:
     dataset_name: str = ""
 
     wandb_project = None
-    run_name: str = f"LOC-{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
-    output_dir: str = "/root/autodl-tmp/pretrained/phi4/" + f"{run_name}"
+    run_name: str = "LOC-2026-05-09_18-49"
+    output_dir: str = "/data/ckpt/pretrained/phi4/" + f"{run_name}"
 
-    num_train_epochs: int = 3
+    num_train_epochs: int = 4
     batch_size_per_gpu: int = 1
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 16
     lr: float = 5e-6
     # SigLIP patch_embedding lr; None -> same as ``lr``.
     lr_patch_conv: Optional[float] = 5e-5
     # New: token-embedding lr for fast learning of the new <loc_*> rows.
-    lr_embed: Optional[float] = 1e-4
+    lr_embed: Optional[float] = 1e-5
     lora_r: int = 32
-    warmup_steps: int = 150
+    warmup_steps: int = 80
     weight_decay: float = 1e-6
     max_grad_norm: float = 1.0
 
@@ -55,7 +59,7 @@ class DriveLMNusPhi4LocTokensConfig:
     use_flash_attention: bool = True
     use_lora: bool = True
 
-    resume_from_checkpoint: bool = False
+    resume_from_checkpoint: bool = True
     save_lora_adapter_when_checkpointing: bool = True
 
     save_steps: int = 99999

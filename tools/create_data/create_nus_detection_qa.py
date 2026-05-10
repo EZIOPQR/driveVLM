@@ -28,6 +28,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -45,6 +46,7 @@ except ImportError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from datasets import Dataset
+from tqdm import tqdm
 
 
 CAMERAS: Tuple[str, ...] = (
@@ -192,13 +194,16 @@ def _classify(category_name: str, groups: Dict[str, List[str]]) -> str | None:
     return best_friendly
 
 
-def _box_center_2d(box, K: np.ndarray) -> Tuple[float, float] | None:
+def _box_center_and_area_2d(box, K: np.ndarray) -> Tuple[float, float, float] | None:
     if box.center[2] <= 0:
         return None
     corners_2d = view_points(box.corners(), K, normalize=True)[:2]
     x_min, y_min = corners_2d.min(axis=1)
     x_max, y_max = corners_2d.max(axis=1)
-    return float((x_min + x_max) / 2.0), float((y_min + y_max) / 2.0)
+    cx = float((x_min + x_max) / 2.0)
+    cy = float((y_min + y_max) / 2.0)
+    area = float((x_max - x_min) * (y_max - y_min))
+    return cx, cy, area
 
 
 def _scale_to_target(cx: float, cy: float, orig_size, img_size: int):
@@ -210,18 +215,15 @@ def _resolve_image_paths(nusc: NuScenes, sample, dataroot: str) -> List[str] | N
     for cam in CAMERAS:
         sd_token = sample["data"][cam]
         sd = nusc.get("sample_data", sd_token)
-        full = os.path.join(dataroot, sd["filename"])
-        if not os.path.isfile(full):
-            return None
-        paths.append(full)
+        paths.append(os.path.join(dataroot, sd["filename"]))
     return paths
 
 
 def _collect_per_cam_boxes(
     nusc: NuScenes, sample, *, img_size: int, max_distance: float,
     groups: Dict[str, List[str]],
-) -> Dict[str, List[Tuple[str, float, float]]]:
-    per_cam: Dict[str, List[Tuple[str, float, float]]] = {c: [] for c in CAMERAS}
+) -> Dict[str, List[Tuple[str, float, float, float]]]:
+    per_cam: Dict[str, List[Tuple[str, float, float, float]]] = {c: [] for c in CAMERAS}
     for cam in CAMERAS:
         sd_token = sample["data"][cam]
         try:
@@ -236,14 +238,14 @@ def _collect_per_cam_boxes(
                 continue
             if float(np.linalg.norm(box.center)) > max_distance:
                 continue
-            center_2d = _box_center_2d(box, K)
-            if center_2d is None:
+            result = _box_center_and_area_2d(box, K)
+            if result is None:
                 continue
-            cx_full, cy_full = center_2d
+            cx_full, cy_full, area_full = result
             cx, cy = _scale_to_target(cx_full, cy_full, (1600, 900), img_size)
             if not (0.0 <= cx < img_size and 0.0 <= cy < img_size):
                 continue
-            per_cam[cam].append((cat, cx, cy))
+            per_cam[cam].append((cat, cx, cy, area_full))
     return per_cam
 
 
@@ -270,31 +272,41 @@ def _pick_n_categories(
     upper = min(max_cats, len(cats_present))
     if upper <= 1:
         return [rng.choice(cats_present)] if cats_present else []
-    # Bias: 50% one-cat, 30% two-cat, 20% three-cat (clipped to ``upper``).
-    weights = [50, 30, 20][:upper]
+    # Bias toward fewer categories; weights are clipped to ``upper``.
+    weights = [60, 40, 20, 10][:upper]
     n = rng.choices(range(1, upper + 1), weights=weights, k=1)[0]
     return rng.sample(cats_present, n)
 
 
-def _gather_tags(
+def _gather_tags_by_cat(
     chosen_cats: List[str],
-    per_cam: Dict[str, List[Tuple[str, float, float]]],
-) -> List[str]:
-    """Flatten boxes from chosen categories into ``<cN,CAM,x,y>`` tags.
+    per_cam: Dict[str, List[Tuple[str, float, float, float]]],
+    *,
+    top_k_per_cat: int,
+) -> List[Tuple[str, List[str]]]:
+    """Group top-k tags per chosen category, preserving ``chosen_cats`` order.
 
-    Order: outer loop over chosen_cats (preserves question order), inner over
-    fixed CAMERAS order. Single global ``cN`` counter starting at 1.
+    Returns a list of ``(category, [tags])`` pairs. ``cN`` counter is global and
+    increments in final emission order; categories with no visible boxes are
+    still included with an empty list.
     """
-    tags = []
+    result: List[Tuple[str, List[str]]] = []
     cid = 1
     for cat in chosen_cats:
-        for cam in CAMERAS:
-            for c, x, y in per_cam[cam]:
+        candidates: List[Tuple[float, int, str, float, float]] = []
+        for cam_idx, cam in enumerate(CAMERAS):
+            for c, x, y, area in per_cam[cam]:
                 if c != cat:
                     continue
-                tags.append(f"<c{cid},{cam},{x:.2f},{y:.2f}>")
-                cid += 1
-    return tags
+                # Negative area so Python's stable sort gives area desc, then cam asc.
+                candidates.append((-area, cam_idx, cam, x, y))
+        candidates.sort()
+        tags = []
+        for _, _, cam, x, y in candidates[:top_k_per_cat]:
+            tags.append(f"<c{cid},{cam},{x:.2f},{y:.2f}>")
+            cid += 1
+        result.append((cat, tags))
+    return result
 
 
 def _format_positive_question(
@@ -316,34 +328,42 @@ def _format_positive_question(
     return tmpl.format(singulars=singulars_phrase)
 
 
-def _format_positive_answer(tags: List[str], rng: random.Random) -> str:
+def _format_category_section(cat: str, tags: List[str]) -> str:
+    """Fixed ``Plural: <tag>, <tag>.`` section, with plural capitalized."""
+    plural, _ = _names_for(cat)
+    label = plural[:1].upper() + plural[1:]
     if not tags:
-        return rng.choice(DEFAULT_EMPTY_LIST_ANSWERS)
-    prefix = rng.choice(DEFAULT_POSITIVE_PREFIXES)
-    body = ", ".join(tags)
-    if prefix:
-        return f"{prefix}{body}."
-    return f"{body}."
+        return f"{label}: none."
+    return f"{label}: {', '.join(tags)}."
+
+
+def _format_positive_answer(grouped: List[Tuple[str, List[str]]]) -> str:
+    """Deterministic multi-category answer: ``Cars: <..>. Pedestrians: <..>.``"""
+    if not any(tags for _, tags in grouped):
+        return "None."
+    sections = [_format_category_section(cat, tags) for cat, tags in grouped]
+    return " ".join(sections)
 
 
 def _format_existence_qa(
     cat: str,
-    per_cam: Dict[str, List[Tuple[str, float, float]]],
-    rng: random.Random,
+    per_cam: Dict[str, List[Tuple[str, float, float, float]]],
     existence_templates: List[str],
+    rng: random.Random,
+    *,
+    top_k_per_cat: int,
 ) -> Tuple[str, str]:
     plural, singular = _names_for(cat)
     q = rng.choice(existence_templates).format(plural=plural, singular=singular)
-    tags = _gather_tags([cat], per_cam)
+    grouped = _gather_tags_by_cat([cat], per_cam, top_k_per_cat=top_k_per_cat)
+    tags = grouped[0][1]
     if tags:
-        prefix = rng.choice(DEFAULT_AFFIRMATIVE_PREFIXES)
-        body = ", ".join(tags)
-        return q, f"{prefix}{body}."
-    return q, rng.choice(DEFAULT_NEGATIVE_ANSWERS)
+        return q, f"Yes. {_format_category_section(cat, tags)}"
+    return q, "No."
 
 
 def _build_qa(
-    per_cam: Dict[str, List[Tuple[str, float, float]]],
+    per_cam: Dict[str, List[Tuple[str, float, float, float]]],
     *,
     plural_templates: List[str],
     singular_templates: List[str],
@@ -352,22 +372,28 @@ def _build_qa(
     max_cats: int,
     p_existence: float,
 ) -> Tuple[str, str] | None:
-    cats_present = sorted({c for boxes in per_cam.values() for c, _, _ in boxes})
+    cats_present = sorted({c for boxes in per_cam.values() for c, _, _, _ in boxes})
+
+    # Each question keeps at most ``top_k_per_cat`` largest boxes per category,
+    # sampled per-question to give the model variety between 1- and 4-answer forms.
+    top_k_per_cat = rng.randint(1, 4)
 
     # Prefer positive multi-cat questions when the frame has any objects.
     if cats_present and rng.random() > p_existence:
         chosen = _pick_n_categories(cats_present, rng, max_cats)
         if chosen:
             q = _format_positive_question(chosen, rng, plural_templates, singular_templates)
-            tags = _gather_tags(chosen, per_cam)
-            a = _format_positive_answer(tags, rng)
+            grouped = _gather_tags_by_cat(chosen, per_cam, top_k_per_cat=top_k_per_cat)
+            a = _format_positive_answer(grouped)
             return q, a
 
     # Existence question: pick any known category. Sometimes hits a category that
     # IS present (Yes + tags), sometimes one that isn't (No), giving the model
     # both signals at the same template.
     cat = rng.choice(list(CATEGORY_NAMES.keys()))
-    return _format_existence_qa(cat, per_cam, rng, existence_templates)
+    return _format_existence_qa(
+        cat, per_cam, existence_templates, rng, top_k_per_cat=top_k_per_cat,
+    )
 
 
 def _split_scenes(nusc: NuScenes, val_ratio: float, seed: int):
@@ -443,7 +469,14 @@ def generate(args):
     def _val_full() -> bool:
         return max_val_qa is not None and len(val_rows) >= max_val_qa
 
-    for s_idx in sample_indices:
+    # Generating tens of thousands of rows makes gen2 GC sweeps grow linearly with
+    # the number of tracked objects, which manifests as gradually slowing iteration.
+    # We don't build cycles, so it's safe to disable cyclic GC during the hot loop
+    # and let refcounting reclaim memory as usual.
+    gc.disable()
+    try:
+        pbar = tqdm(sample_indices, desc="generating QA", unit="sample")
+        for s_idx in pbar:
         if _train_full() and _val_full():
             break
         sample = nusc.sample[s_idx]
@@ -504,12 +537,10 @@ def generate(args):
                 n_existence_q += 1
 
         n_processed += 1
-        if n_processed % 200 == 0:
-            print(f"  processed {n_processed}/{len(nusc.sample)} samples "
-                  f"(train={len(train_rows)}/"
-                  f"{max_train_qa if max_train_qa is not None else '∞'}, "
-                  f"val={len(val_rows)}/"
-                  f"{max_val_qa if max_val_qa is not None else '∞'})")
+        pbar.set_postfix(
+            train=f"{len(train_rows)}/{max_train_qa if max_train_qa is not None else '∞'}",
+            val=f"{len(val_rows)}/{max_val_qa if max_val_qa is not None else '∞'}",
+        )
 
     print(f"skipped {n_skipped_missing_imgs} samples (missing image files)")
     print(f"final: train={len(train_rows)}, val={len(val_rows)}")
