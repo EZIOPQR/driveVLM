@@ -43,7 +43,7 @@ def main(args):
     #   ``Phi4MMAudioFeatureExtractor.__init__`` signature.
     # - Then OVERLAY the tokenizer from the checkpoint (or --processor) so the
     #   added <loc_*> tokens come through.
-    BASE = "/data/huggingface/Phi-4-multimodal-instruct"
+    BASE = "/root/autodl-tmp/phi-4-multimodal-finetuned/"
     if args.processor:
         tokenizer_src = args.processor
     elif os.path.isfile(os.path.join(args.model, "tokenizer.json")) \
@@ -144,7 +144,7 @@ def parse_args():
     )
     parser.add_argument(
         "--model", type=str,
-        default="/data/huggingface/Phi-4-multimodal-instruct",
+        default="/root/autodl-tmp/epoch-4",
         help="Path to model or fine-tuned checkpoint",
     )
     parser.add_argument(

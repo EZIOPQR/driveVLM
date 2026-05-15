@@ -2,6 +2,7 @@ import time
 import json
 import argparse
 import re
+import os
 from functools import partial
 
 import numpy as np
@@ -9,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from datasets import load_from_disk
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, GenerationConfig
 
 from drivevlms.build import build_collate_fn
 
@@ -82,9 +83,26 @@ class LatencyProfiler:
 @torch.no_grad()
 def main(args):
 
-    # Load model and processor
-    base_model = "/root/autodl-tmp/models/Phi-4-multimodal-instruct"
+    # Keep processor implementation from base Phi-4, then optionally overlay tokenizer
+    # from finetuned checkpoint to preserve added special tokens (e.g. <loc_*>).
+    base_model = "/root/autodl-tmp/phi-4-multimodal-finetuned/"
+    if args.processor:
+        tokenizer_src = args.processor
+    elif os.path.isfile(os.path.join(args.model, "tokenizer.json")) \
+            or os.path.isfile(os.path.join(args.model, "added_tokens.json")):
+        tokenizer_src = args.model
+    else:
+        tokenizer_src = base_model
+    print(f"[inference] processor base = {base_model}")
+    print(f"[inference] tokenizer src  = {tokenizer_src}")
+
     processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=True)
+    if tokenizer_src != base_model:
+        processor.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_src, trust_remote_code=True
+        )
+        print(f"[inference] tokenizer vocab size = {len(processor.tokenizer)}")
+        print(f"[inference] tokenize('<loc_30>') -> {processor.tokenizer.tokenize('<loc_30>')}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
@@ -177,10 +195,14 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DriveLM Inference')
-    parser.add_argument("--data", type=str, default="data/DriveLM_nuScenes/split/val")
+    parser.add_argument("--data", type=str, default="data/DriveLM_nuScenes/split_448/val")
     parser.add_argument("--collate_fn", type=str, default="drivelm_nus_phi4_collate_fn_val")
-    parser.add_argument("--output", type=str, default="data/DriveLM_nuScenes/refs/infer_results_21-49.json")
-    parser.add_argument("--model", type=str, default="/root/autodl-tmp/models/Phi-4-multimodal-instruct", help="Path to model or checkpoint")
+    parser.add_argument("--output", type=str, default="data/DriveLM_nuScenes/refs/infer_smoke.json")
+    parser.add_argument("--model", type=str, default="/root/autodl-tmp/epoch-4/", help="Path to model or checkpoint")
+    parser.add_argument(
+        "--processor", type=str, default=None,
+        help="Path to processor/tokenizer dir. If unset, uses --model when it has tokenizer files, else base Phi-4 path.",
+    )
     parser.add_argument("--device", default="cuda", help="Device to run inference")
     parser.add_argument("--limit", type=int, default=None, help="Only run on the first N samples (useful for smoke test). Default: run full set.")
     parser.add_argument(
