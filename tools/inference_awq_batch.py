@@ -1,18 +1,18 @@
-"""Batched inference for DriveLM (Phi-4 path).
-
-Mirrors tools/inference.py but exposes --batch_size and --max_new_tokens, and
-relies on the (now batch-capable) drivelm_nus_phi4_collate_fn_val to feed
-left-padded inputs to model.generate().
-
-Output schema is identical to tools/inference.py to keep tools/evaluation.py
-working without changes:
-    [{"id": str, "question": str, "answer": str}, ...]
+#!/usr/bin/env python3
 """
+Batched inference for DriveLM using exported AWQ package.
+
+Expected AWQ package layout:
+- manifest.json
+- awq_int4_delta.pt (or manifest["awq_delta"])
+"""
+
 import argparse
 import datetime as dt
 import json
 import os
 import re
+import sys
 import time
 from functools import partial
 from typing import Any, Dict, Tuple
@@ -21,9 +21,14 @@ import torch
 from datasets import load_from_disk
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, GenerationConfig
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from drivevlms.build import build_collate_fn
+from tools.awq_int4_decoder import apply_awq_delta_to_model
 
 
 _LOC_RE = re.compile(r"<loc_(\d+)>")
@@ -31,7 +36,6 @@ _CTRL_TOKEN_RE = re.compile(r"<\|[^|>]+\|>")
 
 
 def _postprocess_generated(text: str, stride: int = 4) -> str:
-    """Convert ``<loc_k>`` back to numeric pixel values and strip Phi-4 control tokens."""
     text = _LOC_RE.sub(lambda m: f"{int(m.group(1)) * stride:.2f}", text)
     text = _CTRL_TOKEN_RE.sub("", text)
     return text.strip()
@@ -94,10 +98,11 @@ class StageProfiler:
         self._cuda_sync()
         if self.cuda_enabled:
             torch.cuda.reset_peak_memory_stats(self.device)
-        alloc_before, _ = self._cuda_mem()
+        alloc_before, reserved_before = self._cuda_mem()
         self._active[key] = {
             "start": time.perf_counter(),
             "alloc_before": alloc_before,
+            "reserved_before": reserved_before,
         }
 
     def _stage_end(self, key: str) -> Tuple[float, int, int, int]:
@@ -107,7 +112,10 @@ class StageProfiler:
         self._cuda_sync()
         elapsed_ms = (time.perf_counter() - item["start"]) * 1000.0
         alloc_after, reserved_after = self._cuda_mem()
-        peak_alloc = torch.cuda.max_memory_allocated(self.device) if self.cuda_enabled else 0
+        if self.cuda_enabled:
+            peak_alloc = torch.cuda.max_memory_allocated(self.device)
+        else:
+            peak_alloc = 0
         return elapsed_ms, peak_alloc, reserved_after, max(0, alloc_after - item["alloc_before"])
 
     def _record_stage(self, stage_name: str, elapsed_ms: float, peak_alloc: int, reserved: int, delta_alloc: int) -> None:
@@ -175,48 +183,109 @@ class StageProfiler:
         self._hooks.clear()
 
 
+def _load_awq_manifest(package_dir: str) -> Tuple[str, str]:
+    manifest_path = os.path.join(package_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"manifest not found: {manifest_path}")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    for key in ("base_model_path", "awq_delta"):
+        if key not in manifest:
+            raise KeyError(f"manifest missing required field: {key}")
+
+    base_model_path = manifest["base_model_path"]
+    if not os.path.isdir(base_model_path):
+        raise FileNotFoundError(f"base_model_path directory not found: {base_model_path}")
+
+    delta_rel_or_abs = manifest["awq_delta"]
+    delta_path = (
+        delta_rel_or_abs
+        if os.path.isabs(delta_rel_or_abs)
+        else os.path.join(package_dir, delta_rel_or_abs)
+    )
+    if not os.path.exists(delta_path):
+        raise FileNotFoundError(f"awq delta not found: {delta_path}")
+    return base_model_path, delta_path
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="DriveLM AWQ batched inference")
+    p.add_argument("--awq_package_dir", type=str, required=True, help="Exported AWQ package dir")
+    p.add_argument("--data", type=str, default="data/DriveLM_nuScenes/split_448/val")
+    p.add_argument("--collate_fn", type=str, default="drivelm_nus_phi4_collate_fn_val")
+    p.add_argument("--output", type=str, default="data/DriveLM_nuScenes/refs/infer_results_l10_awq.json")
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument(
+        "--processor_base",
+        type=str,
+        default="/root/autodl-tmp/phi-4-multimodal-finetuned/",
+        help="Base processor path used to initialize multimodal processor.",
+    )
+    p.add_argument(
+        "--processor",
+        type=str,
+        default=None,
+        help="Optional tokenizer/processor dir override for tokenizer overlay.",
+    )
+    p.add_argument("--use_optical_flow", action="store_true")
+    p.add_argument("--flow_root", type=str, default="")
+    p.add_argument("--flow_scale_u", type=float, default=8.778)
+    p.add_argument("--flow_scale_v", type=float, default=2.888)
+    p.add_argument("--profile", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--profile_output",
+        type=str,
+        default="",
+        help="Output JSON path for inference profile. Default: <output_basename>.profile.json",
+    )
+    return p
+
+
 @torch.no_grad()
-def main(args):
+def main() -> None:
+    args = _build_parser().parse_args()
     run_start = time.perf_counter()
     run_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-    # Strategy:
-    # - Always load the processor (image + audio + tokenizer) from the BASE Phi-4
-    #   path, because the fine-tuned checkpoint serialized an older
-    #   ``preprocessor_config.json`` whose audio fields no longer match the current
-    #   ``Phi4MMAudioFeatureExtractor.__init__`` signature.
-    # - Then OVERLAY the tokenizer from the checkpoint (or --processor) so the
-    #   added <loc_*> tokens come through.
-    BASE = "/root/autodl-tmp/phi-4-multimodal-finetuned/"
+    base_model_path, delta_path = _load_awq_manifest(args.awq_package_dir)
+
+    if not os.path.isdir(args.processor_base):
+        raise FileNotFoundError(f"processor_base directory not found: {args.processor_base}")
+
     if args.processor:
         tokenizer_src = args.processor
-    elif os.path.isfile(os.path.join(args.model, "tokenizer.json")) \
-            or os.path.isfile(os.path.join(args.model, "added_tokens.json")):
-        tokenizer_src = args.model
+    elif os.path.isfile(os.path.join(base_model_path, "tokenizer.json")) or os.path.isfile(
+        os.path.join(base_model_path, "added_tokens.json")
+    ):
+        tokenizer_src = base_model_path
     else:
-        tokenizer_src = BASE
-    print(f"[inference_batch] processor base = {BASE}")
-    print(f"[inference_batch] tokenizer src  = {tokenizer_src}")
+        tokenizer_src = args.processor_base
 
-    processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
-    if tokenizer_src != BASE:
-        from transformers import AutoTokenizer
-        processor.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_src, trust_remote_code=True
-        )
-        print(f"[inference_batch] tokenizer vocab size = {len(processor.tokenizer)}")
-        # Sanity: confirm <loc_*> are atomic single tokens
-        sample_toks = processor.tokenizer.tokenize("<loc_30>")
-        print(f"[inference_batch] tokenize('<loc_30>') -> {sample_toks}")
+    print(f"[inference_awq] processor base = {args.processor_base}")
+    print(f"[inference_awq] tokenizer src  = {tokenizer_src}")
+    print(f"[inference_awq] base model     = {base_model_path}")
+    print(f"[inference_awq] awq delta      = {delta_path}")
+
+    processor = AutoProcessor.from_pretrained(args.processor_base, trust_remote_code=True)
+    if tokenizer_src != args.processor_base:
+        processor.tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, trust_remote_code=True)
+        print(f"[inference_awq] tokenizer vocab size = {len(processor.tokenizer)}")
+        print(f"[inference_awq] tokenize('<loc_30>') -> {processor.tokenizer.tokenize('<loc_30>')}")
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        _attn_implementation='flash_attention_2',
+        base_model_path,
+        torch_dtype=torch.float16,
+        _attn_implementation="flash_attention_2",
         trust_remote_code=True,
     )
+    apply_awq_delta_to_model(model, delta_path, map_location="cpu")
     model.to(args.device)
     model.eval()
-    generation_config = GenerationConfig.from_pretrained(BASE)
+    generation_config = GenerationConfig.from_pretrained(args.processor_base)
     profiler = StageProfiler(model, device=args.device) if args.profile else None
 
     collate_fn = build_collate_fn(args.collate_fn)
@@ -235,7 +304,7 @@ def main(args):
     if args.limit is not None and args.limit > 0:
         n = min(args.limit, total)
         dataset = Subset(dataset, list(range(n)))
-        print(f"[inference_batch] --limit={args.limit} -> running on first {n}/{total} samples")
+        print(f"[inference_awq] --limit={args.limit} -> running on first {n}/{total} samples")
 
     dataloader = DataLoader(
         dataset,
@@ -244,40 +313,35 @@ def main(args):
         num_workers=args.num_workers,
         shuffle=False,
     )
-    print(f"[inference_batch] batch_size={args.batch_size}, "
-          f"max_new_tokens={args.max_new_tokens}, "
-          f"num_batches={len(dataloader)}")
+    print(
+        f"[inference_awq] batch_size={args.batch_size}, max_new_tokens={args.max_new_tokens}, "
+        f"num_batches={len(dataloader)}"
+    )
 
-    data_dict = []
+    outputs = []
     total_input_tokens = 0
     total_generated_tokens = 0
     for batch in tqdm(dataloader):
         inputs, questions, ids = batch
         inputs = inputs.to(args.device)
         input_len = inputs["input_ids"].shape[-1]
-        output = model.generate(
+        generated = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
             generation_config=generation_config,
         )
-        # Same input_len for every sample in batch (left padding aligns them).
-        output = output[:, input_len:]
-        total_input_tokens += int(input_len * output.shape[0])
-        total_generated_tokens += int(output.shape[0] * output.shape[1])
-        # Keep <loc_*> in the decoded text, then post-process to numeric coords.
-        answers = processor.batch_decode(output, skip_special_tokens=False)
+        generated = generated[:, input_len:]
+        total_input_tokens += int(input_len * generated.shape[0])
+        total_generated_tokens += int(generated.shape[0] * generated.shape[1])
+        answers = processor.batch_decode(generated, skip_special_tokens=False)
         answers = [_postprocess_generated(a) for a in answers]
-
-        assert len(answers) == len(ids) == len(questions), (
-            f"len mismatch: answers={len(answers)} ids={len(ids)} questions={len(questions)}"
-        )
         for sid, q, a in zip(ids, questions, answers):
-            data_dict.append({"id": sid, "question": q, "answer": a})
+            outputs.append({"id": sid, "question": q, "answer": a})
         if profiler is not None:
             profiler.finalize_sample()
 
         with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(data_dict, f, indent=4)
+            json.dump(outputs, f, ensure_ascii=False, indent=2)
 
     run_end = time.perf_counter()
     run_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -290,12 +354,13 @@ def main(args):
                 "total_seconds": run_end - run_start,
             },
             "config": {
-                "script": "tools/inference_batch.py",
+                "script": "tools/inference_awq_batch.py",
                 "args": vars(args),
                 "resolved": {
-                    "processor_base": BASE,
+                    "base_model_path": base_model_path,
+                    "delta_path": delta_path,
                     "tokenizer_src": tokenizer_src,
-                    "model_path": args.model,
+                    "generation_config_src": args.processor_base,
                 },
             },
             "runtime": {
@@ -307,7 +372,7 @@ def main(args):
             "dataset": {
                 "path": args.data,
                 "total_samples": total,
-                "evaluated_samples": len(data_dict),
+                "evaluated_samples": len(outputs),
                 "num_batches": len(dataloader),
             },
             "tokens": {
@@ -319,78 +384,11 @@ def main(args):
         with open(profile_path, "w", encoding="utf-8") as f:
             json.dump(profile, f, ensure_ascii=False, indent=2)
         profiler.close()
-        print(f"[inference_batch] profile saved to: {profile_path}")
+        print(f"[inference_awq] profile saved to: {profile_path}")
+
+    print(f"[inference_awq] done. output saved to: {args.output}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="DriveLM Batched Inference (Phi-4)")
-    parser.add_argument("--data", type=str, default="data/DriveLM_nuScenes/split_448/val")
-    parser.add_argument(
-        "--collate_fn", type=str, default="drivelm_nus_phi4_collate_fn_val",
-        help="Must point at a val collate fn that supports batch>1. "
-             "drivelm_nus_phi4_collate_fn_val is now batch-capable.",
-    )
-    parser.add_argument(
-        "--output", type=str,
-        default="data/DriveLM_nuScenes/refs/infer_results_batch.json",
-    )
-    parser.add_argument(
-        "--model", type=str,
-        default="/root/autodl-tmp/epoch-4",
-        help="Path to model or fine-tuned checkpoint",
-    )
-    parser.add_argument(
-        "--processor", type=str, default=None,
-        help="Path to processor/tokenizer dir. If unset, uses --model when it has "
-             "tokenizer files (recommended for loc-tokens checkpoints), else falls "
-             "back to the base Phi-4 path.",
-    )
-    parser.add_argument("--device", default="cuda", help="Device to run inference")
-    parser.add_argument(
-        "--batch_size", type=int, default=4,
-        help="DataLoader batch size. Phi-4 bf16 + 6*448 imgs: 4 fits ~24GB, 8 needs more.",
-    )
-    parser.add_argument(
-        "--max_new_tokens", type=int, default=256,
-        help="Generation cap. 256 is plenty for DriveLM answers; lower if you want more speed.",
-    )
-    parser.add_argument(
-        "--limit", type=int, default=None,
-        help="Only run on the first N samples (for smoke test). Default: full set.",
-    )
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument(
-        "--use_optical_flow",
-        action="store_true",
-        help="5-channel SigLIP input; run compute_flow_from_sweeps.py and set --flow-root.",
-    )
-    parser.add_argument(
-        "--flow_root",
-        type=str,
-        default="",
-        help="Root with CAM_*/<jpg_stem>.npz (default: config flow_root when training).",
-    )
-    parser.add_argument(
-        "--flow_scale_u",
-        type=float,
-        default=8.778,
-        help="Normalization divisor for flow u channel.",
-    )
-    parser.add_argument(
-        "--flow_scale_v",
-        type=float,
-        default=2.888,
-        help="Normalization divisor for flow v channel.",
-    )
-    parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--profile_output",
-        type=str,
-        default="",
-        help="Output JSON path for inference profile. Default: <output_basename>.profile.json",
-    )
-    return parser.parse_args()
+if __name__ == "__main__":
+    main()
 
-
-if __name__ == '__main__':
-    main(parse_args())

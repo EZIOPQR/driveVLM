@@ -1,11 +1,12 @@
 import time
+import datetime as dt
 import json
 import argparse
 import re
 import os
 from functools import partial
+from typing import Any, Dict, Tuple
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from datasets import load_from_disk
@@ -27,12 +28,21 @@ def _postprocess_generated(text: str, stride: int = 4) -> str:
 
 
 class LatencyProfiler:
-    """Measures vision tower, LLM prefill, and LLM decode latencies via forward hooks."""
+    """Collect latency and CUDA memory stats for vision/prefill/decode."""
 
     def __init__(self, model, device="cuda"):
         self.device = device
+        self.cuda_enabled = torch.cuda.is_available() and str(device).startswith("cuda")
         self._hooks = []
-        self.reset()
+        self._active: Dict[str, Dict[str, Any]] = {}
+        self._backbone_call_count = 0
+        self._last_vision_ms = 0.0
+        self._last_backbone_mem: Tuple[int, int, int] = (0, 0, 0)
+        self.stats: Dict[str, Dict[str, float]] = {
+            "vision_tower": self._empty_stage(),
+            "prefill": self._empty_stage(),
+            "decode": self._empty_stage(),
+        }
 
         vision_tower = model.model.embed_tokens_extend.image_embed
         backbone = model.model
@@ -42,46 +52,120 @@ class LatencyProfiler:
         self._hooks.append(backbone.register_forward_pre_hook(self._backbone_pre))
         self._hooks.append(backbone.register_forward_hook(self._backbone_post))
 
-    def reset(self):
-        self.vision_ms = 0.0
-        self.prefill_ms = 0.0
-        self.decode_ms = 0.0
-        self._backbone_call_count = 0
-        self._vision_start = 0.0
-        self._backbone_start = 0.0
+    @staticmethod
+    def _empty_stage() -> Dict[str, float]:
+        return {
+            "total_ms": 0.0,
+            "calls": 0.0,
+            "max_allocated_bytes": 0.0,
+            "max_reserved_bytes": 0.0,
+            "max_active_delta_allocated_bytes": 0.0,
+        }
+
+    def _cuda_sync(self) -> None:
+        if self.cuda_enabled:
+            torch.cuda.synchronize(self.device)
+
+    def _cuda_mem(self) -> Tuple[int, int]:
+        if not self.cuda_enabled:
+            return 0, 0
+        return torch.cuda.memory_allocated(self.device), torch.cuda.memory_reserved(self.device)
+
+    def _stage_start(self, key: str) -> None:
+        self._cuda_sync()
+        if self.cuda_enabled:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        alloc_before, _ = self._cuda_mem()
+        self._active[key] = {"start": time.perf_counter(), "alloc_before": alloc_before}
+
+    def _stage_end(self, key: str) -> Tuple[float, int, int, int]:
+        item = self._active.pop(key, None)
+        if item is None:
+            return 0.0, 0, 0, 0
+        self._cuda_sync()
+        elapsed_ms = (time.perf_counter() - item["start"]) * 1000.0
+        alloc_after, reserved_after = self._cuda_mem()
+        peak_alloc = torch.cuda.max_memory_allocated(self.device) if self.cuda_enabled else 0
+        return elapsed_ms, peak_alloc, reserved_after, max(0, alloc_after - item["alloc_before"])
+
+    def _record_stage(self, stage_name: str, elapsed_ms: float, peak_alloc: int, reserved: int, delta_alloc: int) -> None:
+        stage = self.stats[stage_name]
+        stage["total_ms"] += max(0.0, elapsed_ms)
+        stage["calls"] += 1.0
+        stage["max_allocated_bytes"] = max(stage["max_allocated_bytes"], float(peak_alloc))
+        stage["max_reserved_bytes"] = max(stage["max_reserved_bytes"], float(reserved))
+        stage["max_active_delta_allocated_bytes"] = max(
+            stage["max_active_delta_allocated_bytes"],
+            float(delta_alloc),
+        )
 
     def _vision_pre(self, module, input):
-        torch.cuda.synchronize(self.device)
-        self._vision_start = time.perf_counter()
+        self._stage_start("vision")
 
     def _vision_post(self, module, input, output):
-        torch.cuda.synchronize(self.device)
-        self.vision_ms += (time.perf_counter() - self._vision_start) * 1000
+        elapsed_ms, peak_alloc, reserved, delta_alloc = self._stage_end("vision")
+        self._last_vision_ms = elapsed_ms
+        self._record_stage("vision_tower", elapsed_ms, peak_alloc, reserved, delta_alloc)
 
     def _backbone_pre(self, module, input):
-        torch.cuda.synchronize(self.device)
-        self._backbone_start = time.perf_counter()
+        self._stage_start("backbone")
 
     def _backbone_post(self, module, input, output):
-        torch.cuda.synchronize(self.device)
-        elapsed_ms = (time.perf_counter() - self._backbone_start) * 1000
+        elapsed_ms, peak_alloc, reserved, delta_alloc = self._stage_end("backbone")
+        self._last_backbone_mem = (peak_alloc, reserved, delta_alloc)
         if self._backbone_call_count == 0:
-            self.prefill_ms = elapsed_ms - self.vision_ms
+            self._record_stage(
+                "prefill",
+                max(0.0, elapsed_ms - self._last_vision_ms),
+                peak_alloc,
+                reserved,
+                delta_alloc,
+            )
         else:
-            self.decode_ms += elapsed_ms
+            self._record_stage("decode", elapsed_ms, peak_alloc, reserved, delta_alloc)
         self._backbone_call_count += 1
 
-    @property
-    def num_decode_steps(self):
-        return max(0, self._backbone_call_count - 1)
+    def finalize_sample(self) -> None:
+        if self._backbone_call_count == 1:
+            peak_alloc, reserved, delta_alloc = self._last_backbone_mem
+            self._record_stage("decode", 0.0, peak_alloc, reserved, delta_alloc)
+        self._backbone_call_count = 0
+        self._last_vision_ms = 0.0
+        self._last_backbone_mem = (0, 0, 0)
+
+    def summary(self) -> Dict[str, Dict[str, float]]:
+        out: Dict[str, Dict[str, float]] = {}
+        for name, stage in self.stats.items():
+            calls = max(1.0, stage["calls"])
+            out[name] = {
+                "total_ms": stage["total_ms"],
+                "calls": int(stage["calls"]),
+                "avg_ms": stage["total_ms"] / calls,
+                "max_allocated_bytes": int(stage["max_allocated_bytes"]),
+                "max_reserved_bytes": int(stage["max_reserved_bytes"]),
+                "max_active_delta_allocated_bytes": int(stage["max_active_delta_allocated_bytes"]),
+            }
+        return out
 
     def remove_hooks(self):
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
 
+
+def _gpu_name(device: str, cuda_enabled: bool) -> str:
+    if not cuda_enabled:
+        return ""
+    if ":" in str(device):
+        idx = int(str(device).split(":")[1])
+    else:
+        idx = torch.cuda.current_device()
+    return torch.cuda.get_device_name(idx)
+
 @torch.no_grad()
 def main(args):
+    run_start = time.perf_counter()
+    run_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
 
     # Keep processor implementation from base Phi-4, then optionally overlay tokenizer
     # from finetuned checkpoint to preserve added special tokens (e.g. <loc_*>).
@@ -143,7 +227,7 @@ def main(args):
         input_len = inputs["input_ids"].shape[-1]
         output = model.generate(
             **inputs,
-            max_new_tokens=1000,
+            max_new_tokens=args.max_new_tokens,
             generation_config=generation_config
         )
         output = output[:, input_len:]
@@ -154,22 +238,17 @@ def main(args):
     def flatten(x):
         return x[0] if isinstance(x, list) else x
 
-    warmup_steps = args.warmup if profiler else 0
-    all_vision_ms = []
-    all_prefill_ms_per_token = []
-    all_decode_ms_per_token = []
-
     data_dict = []
+    total_input_tokens = 0
+    total_generated_tokens = 0
     with torch.no_grad():
-        for step, batch in enumerate(tqdm(dataloader)):
+        for _, batch in enumerate(tqdm(dataloader)):
             inputs, question, ids = batch
-            if profiler:
-                profiler.reset()
             results, input_len, num_tokens = infer(inputs.to(args.device))
-            if profiler and step >= warmup_steps:
-                all_vision_ms.append(profiler.vision_ms)
-                all_prefill_ms_per_token.append(profiler.prefill_ms / max(input_len, 1))
-                all_decode_ms_per_token.append(profiler.decode_ms / max(num_tokens, 1))
+            total_input_tokens += int(input_len)
+            total_generated_tokens += int(num_tokens)
+            if profiler is not None:
+                profiler.finalize_sample()
 
             data_dict.append(
                 {'id': flatten(ids), 'question': flatten(question), 'answer': flatten(results)}
@@ -178,20 +257,46 @@ def main(args):
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(data_dict, f, indent=4)
 
-    if profiler:
+    run_end = time.perf_counter()
+    run_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    if profiler is not None:
+        profile_path = args.profile_output or (os.path.splitext(args.output)[0] + ".profile.json")
+        profile = {
+            "timestamps": {
+                "start_utc": run_start_iso,
+                "end_utc": run_end_iso,
+                "total_seconds": run_end - run_start,
+            },
+            "config": {
+                "script": "tools/inference.py",
+                "args": vars(args),
+                "resolved": {
+                    "processor_base": base_model,
+                    "tokenizer_src": tokenizer_src,
+                    "model_path": args.model,
+                },
+            },
+            "runtime": {
+                "device": args.device,
+                "torch_version": torch.__version__,
+                "cuda_available": torch.cuda.is_available(),
+                "gpu_name": _gpu_name(args.device, profiler.cuda_enabled),
+            },
+            "dataset": {
+                "path": args.data,
+                "evaluated_samples": len(data_dict),
+                "num_batches": len(dataloader),
+            },
+            "tokens": {
+                "total_input_tokens": total_input_tokens,
+                "total_generated_tokens": total_generated_tokens,
+            },
+            "stages": profiler.summary(),
+        }
+        with open(profile_path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
         profiler.remove_hooks()
-        vision_arr = np.array(all_vision_ms)
-        prefill_arr = np.array(all_prefill_ms_per_token)
-        decode_arr = np.array(all_decode_ms_per_token)
-
-        print("\n" + "=" * 60)
-        print("Latency Profiling Summary")
-        print("=" * 60)
-        print(f"  Samples: {len(all_vision_ms)} (warmup skipped: {warmup_steps})")
-        print(f"  Vision Tower : {vision_arr.mean():.4f} ± {vision_arr.std():.4f} ms")
-        print(f"  LLM Prefill  : {prefill_arr.mean():.4f} ± {prefill_arr.std():.4f} ms/token")
-        print(f"  LLM Decode   : {decode_arr.mean():.4f} ± {decode_arr.std():.4f} ms/token")
-        print("=" * 60)
+        print(f"[inference] profile saved to: {profile_path}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DriveLM Inference')
@@ -204,6 +309,7 @@ def parse_args():
         help="Path to processor/tokenizer dir. If unset, uses --model when it has tokenizer files, else base Phi-4 path.",
     )
     parser.add_argument("--device", default="cuda", help="Device to run inference")
+    parser.add_argument("--max_new_tokens", type=int, default=256, help="Generation cap per sample")
     parser.add_argument("--limit", type=int, default=None, help="Only run on the first N samples (useful for smoke test). Default: run full set.")
     parser.add_argument(
         "--use_optical_flow",
@@ -217,8 +323,12 @@ def parse_args():
                         help="Enable latency profiling (vision tower / LLM prefill / LLM decode)")
     parser.add_argument("--no_profile", dest="profile", action="store_false",
                         help="Disable latency profiling")
-    parser.add_argument("--warmup", type=int, default=3,
-                        help="Number of warmup samples to skip in latency statistics")
+    parser.add_argument(
+        "--profile_output",
+        type=str,
+        default="",
+        help="Output JSON path for inference profile. Default: <output_basename>.profile.json",
+    )
     args = parser.parse_args()
     return args
 

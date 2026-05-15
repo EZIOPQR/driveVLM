@@ -27,7 +27,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Folder produced by tools/awq_int4_decoder.py --export_dir",
     )
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    p.add_argument("--dtype", type=str, default="float16", choices=["bfloat16", "float16", "float32"])
     p.add_argument(
         "--text_only",
         action="store_true",
@@ -55,8 +55,13 @@ def main() -> None:
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
+    for key in ("base_model_path", "awq_delta"):
+        if key not in manifest:
+            raise KeyError(f"manifest missing required field: {key}")
     base_model_path = manifest["base_model_path"]
     delta_path = os.path.join(args.package_dir, manifest["awq_delta"])
+    if not os.path.exists(delta_path):
+        raise FileNotFoundError(f"awq delta not found: {delta_path}")
     dtype = _to_dtype(args.dtype)
 
     model = AutoModelForCausalLM.from_pretrained(
