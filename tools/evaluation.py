@@ -1,6 +1,8 @@
 import re
 import argparse
 import json
+import datetime as dt
+import os
 import numpy as np
 import torch.nn as nn
 import language_evaluation
@@ -172,6 +174,61 @@ class evaluation_suit():
 
         return scores
 
+
+def _compute_normalized_scores(output: dict):
+    scores = {}
+    if output["language"] is not None:
+        score = 0.0
+        for idx, key in enumerate(output["language"].keys()):
+            if idx < 4:
+                score += output["language"][key] / 4.0 / 3.0
+            elif idx == 4:
+                score += output["language"][key] / 3.0
+            else:
+                score += output["language"][key] / 10.0 / 3.0
+        scores["language"] = score
+
+    if output["match"] is not None:
+        scores["match"] = output["match"] / 100.0
+
+    if output["accuracy"] is not None:
+        scores["accuracy"] = output["accuracy"]
+
+    avg = (sum(scores.values()) / len(scores)) if scores else None
+    return scores, avg
+
+
+def _update_profile_with_eval(profile_path: str, args, output: dict, normalized_scores: dict, avg):
+    if not os.path.exists(profile_path):
+        raise FileNotFoundError(
+            f"profile file not found: {profile_path}. "
+            "Use --profile_json to point to the correct inference profile."
+        )
+    with open(profile_path, "r", encoding="utf-8") as f:
+        profile = json.load(f)
+    if not isinstance(profile, dict):
+        raise ValueError(f"Invalid profile JSON structure: expected object at root, got {type(profile).__name__}")
+
+    profile["evaluation"] = {
+        "updated_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source_prediction_file": args.src,
+        "target_file": args.tgt,
+        "coord_space": {
+            "pred_coord_space": args.pred_coord_space,
+            "gt_coord_space": args.gt_coord_space,
+            "pred_to_gt_scale": args.gt_coord_space / args.pred_coord_space,
+        },
+        "bucket_scores": {
+            "accuracy_tag0": output["accuracy"],
+            "language_tag2": output["language"],
+            "match_tag3": output["match"],
+        },
+        "normalized_scores": normalized_scores,
+        "average_score": avg,
+    }
+    with open(profile_path, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
 if __name__ == '__main__':
     # get args
     parser = argparse.ArgumentParser(description='Evaluation')
@@ -184,6 +241,13 @@ if __name__ == '__main__':
                              'produced before the 448-space migration.')
     parser.add_argument('--gt_coord_space', type=int, default=448,
                         help='Pixel coordinate space the GT JSON uses (default 448).')
+    parser.add_argument(
+        '--profile_json',
+        type=str,
+        default='',
+        help='Inference profile JSON to update with evaluation results. '
+             'Default: <src_basename>.profile.json',
+    )
     args = parser.parse_args()
 
     pred_to_gt_scale = args.gt_coord_space / args.pred_coord_space
@@ -227,38 +291,19 @@ if __name__ == '__main__':
     print("match score:    ", output["match"])
     print("language score: ", output["language"])
 
-    # Normalize to 0-1 and combine the scores: chatgpt, language, match, accuracy
-    scores = {}
-
-    # language
-    if output["language"] is not None:
-        score = 0
-        for idx, key in enumerate(output["language"].keys()):
-            if idx < 4:
-                score += output["language"][key] / 4. / 3.
-            elif idx == 4:
-                score += output["language"][key] / 3.
-            else:
-                score += output["language"][key] / 10. / 3.
-        scores["language"] = score
-    else:
+    scores, avg = _compute_normalized_scores(output)
+    if output["language"] is None:
         print("[skip] language bucket is empty (no tag=2 samples).")
-
-    # match
-    if output["match"] is not None:
-        scores["match"] = output["match"] / 100.
-    else:
+    if output["match"] is None:
         print("[skip] match bucket is empty (no tag=3 samples). "
               "Likely because --limit was too small to cover prediction QAs.")
-
-    # accuracy
-    if output["accuracy"] is not None:
-        scores["accuracy"] = output["accuracy"]
-    else:
+    if output["accuracy"] is None:
         print("[skip] accuracy bucket is empty (no tag=0 samples).")
 
     print(f"normalized scores: {scores}")
-
-    if scores:
-        avg = sum(scores.values()) / len(scores)
+    if avg is not None:
         print(f"average score: {avg:.4f}")
+
+    profile_json = args.profile_json or (os.path.splitext(args.src)[0] + ".profile.json")
+    _update_profile_with_eval(profile_json, args, output, scores, avg)
+    print(f"[eval] profile updated: {profile_json}")

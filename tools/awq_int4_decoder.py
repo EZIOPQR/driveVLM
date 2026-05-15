@@ -22,12 +22,25 @@ import argparse
 import json
 import os
 import shutil
+import math
+import sys
+from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
+from datasets import load_from_disk
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoProcessor
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from drivevlms.build import build_collate_fn
+from tools.quant_calib_utils import select_balanced_calibration_indices
 
 
 TARGET_LINEAR_NAME_GROUPS: Tuple[Tuple[str, ...], ...] = (
@@ -225,20 +238,120 @@ def _resolve_target_name_non_strict(layer: nn.Module, candidates: Sequence[str])
     return None, found
 
 
-def _quantize_one_target(layer: nn.Module, target_name: str, group_size: int) -> Tuple[bool, str]:
-    target = layer.get_submodule(target_name)
-    # Policy: skip LoRA wrappers entirely to avoid changing adapter training/inference behavior.
-    if hasattr(target, "base_layer"):
-        return False, f"{target_name}: LoRA wrapper detected and skipped by policy"
-    if not isinstance(target, nn.Linear):
-        raise TypeError(
-            f"{target_name}: expected nn.Linear, got {type(target).__name__}. "
-            "Refusing silent fallback."
+@torch.no_grad()
+def collect_hessian_diag(
+    model: nn.Module,
+    module_names: Sequence[str],
+    dataloader: DataLoader,
+    device: str,
+    max_batches: int,
+) -> Dict[str, torch.Tensor]:
+    if max_batches <= 0:
+        raise ValueError("max_batches must be > 0 for calibration.")
+    if not module_names:
+        raise ValueError("No target modules provided for calibration.")
+
+    stats: Dict[str, Dict[str, torch.Tensor]] = {}
+    hooks = []
+    for module_name in module_names:
+        module = model.get_submodule(module_name)
+        if not isinstance(module, nn.Linear):
+            raise TypeError(
+                f"Calibration expects nn.Linear at {module_name}, got {type(module).__name__}."
+            )
+        stats[module_name] = {
+            "sum_sq": torch.zeros(module.in_features, dtype=torch.float64),
+            "count": torch.zeros((), dtype=torch.long),
+        }
+
+        def _pre_hook(mod, inputs, name=module_name):
+            x = inputs[0]
+            if not isinstance(x, torch.Tensor):
+                raise TypeError(f"{name}: expected tensor input, got {type(x).__name__}")
+            x2d = x.detach().reshape(-1, x.shape[-1]).to(dtype=torch.float32, device="cpu")
+            if x2d.shape[-1] != stats[name]["sum_sq"].shape[0]:
+                raise ValueError(f"{name}: input hidden dim mismatch.")
+            stats[name]["sum_sq"] += (x2d * x2d).sum(dim=0, dtype=torch.float64)
+            stats[name]["count"] += x2d.shape[0]
+
+        hooks.append(module.register_forward_pre_hook(_pre_hook))
+
+    model.eval()
+    seen_batches = 0
+    progress = tqdm(
+        dataloader,
+        total=max_batches,
+        desc="[awq] calibration",
+        dynamic_ncols=True,
+    )
+    for batch in progress:
+        if seen_batches >= max_batches:
+            break
+        inputs, _, _ = batch
+        inputs = inputs.to(device)
+        try:
+            model(**inputs, use_cache=False)
+        except TypeError:
+            model(**inputs)
+        seen_batches += 1
+
+    for h in hooks:
+        h.remove()
+    if seen_batches == 0:
+        raise RuntimeError("Calibration dataloader produced 0 batches.")
+
+    out: Dict[str, torch.Tensor] = {}
+    for module_name, s in stats.items():
+        count = int(s["count"].item())
+        if count <= 0:
+            raise RuntimeError(f"No calibration activations collected for {module_name}.")
+        h = (s["sum_sq"] / float(count)).to(dtype=torch.float32)
+        out[module_name] = h.clamp(min=1e-8)
+    return out
+
+
+def _awq_quantize_with_group_activation(
+    linear: nn.Linear,
+    h_diag: torch.Tensor,
+    group_size: int,
+    alpha: float = 0.5,
+) -> AWQInt4LinearW4A16:
+    if group_size <= 0:
+        group_size = linear.in_features
+    if linear.in_features % group_size != 0:
+        raise ValueError(
+            f"in_features ({linear.in_features}) must be divisible by group_size ({group_size})."
         )
-  
-    q_module = AWQInt4LinearW4A16.from_linear(target, group_size=group_size)
-    _set_submodule(layer, target_name, q_module.to(next(layer.parameters()).device))
-    return True, f"{target_name}: quantized nn.Linear"
+    if h_diag.numel() != linear.in_features:
+        raise ValueError(f"h_diag length mismatch: {h_diag.numel()} vs {linear.in_features}")
+
+    q_module = AWQInt4LinearW4A16(
+        in_features=linear.in_features,
+        out_features=linear.out_features,
+        group_size=group_size,
+        has_bias=linear.bias is not None,
+    )
+    w = linear.weight.detach().to(torch.float32)
+    groups = linear.in_features // group_size
+    h = h_diag.to(dtype=torch.float32, device=w.device).reshape(groups, group_size)
+    group_importance = h.mean(dim=1).clamp(min=1e-8)
+    group_scale = group_importance.pow(alpha)
+    group_scale = group_scale / group_scale.mean().clamp(min=1e-8)
+
+    w_scaled = w.clone()
+    for g in range(groups):
+        c0 = g * group_size
+        c1 = (g + 1) * group_size
+        w_scaled[:, c0:c1] *= group_scale[g]
+
+    q_int, scales, zeros = AWQInt4LinearW4A16._pseudo_quantize_tensor_int4(w_scaled, group_size)
+    scales = scales / group_scale.unsqueeze(0)
+    q_module.qweight = AWQInt4LinearW4A16._pack_int4(q_int).to(linear.weight.device)
+    q_module.scales = scales.to(dtype=torch.float16, device=linear.weight.device)
+    q_module.zeros = zeros.to(device=linear.weight.device)
+    if linear.bias is not None:
+        q_module.bias = linear.bias.detach().to(dtype=torch.float16, device=linear.weight.device)
+    return q_module
 
 
 def merge_lora_into_base_linear(
@@ -293,6 +406,7 @@ def merge_lora_into_base_linear(
 
 def apply_decoder_awq_int4(
     model: nn.Module,
+    h_diag_map: Dict[str, torch.Tensor],
     group_size: int,
     skip_first_n: int,
     skip_last_n: int,
@@ -318,16 +432,103 @@ def apply_decoder_awq_int4(
         layer_name = f"model.layers.{layer_idx}"
         for target_candidates in target_name_groups:
             target_name = _resolve_target_name(layer, target_candidates, layer_name)
-            ok, log = _quantize_one_target(layer, target_name, group_size=group_size)
             full_name = f"model.layers.{layer_idx}.{target_name}"
-            if ok:
-                quantized_modules.append(full_name)
-            else:
-                skipped_logs.append(f"{full_name} -> {log}")
+            target = layer.get_submodule(target_name)
+            if hasattr(target, "base_layer"):
+                skipped_logs.append(f"{full_name} -> LoRA wrapper detected and skipped by policy")
+                continue
+            if not isinstance(target, nn.Linear):
+                raise TypeError(f"{full_name}: expected nn.Linear, got {type(target).__name__}")
+            if full_name not in h_diag_map:
+                raise KeyError(f"Missing hessian diagonal stats for {full_name}")
+            q_module = _awq_quantize_with_group_activation(
+                linear=target,
+                h_diag=h_diag_map[full_name],
+                group_size=group_size,
+                alpha=0.5,
+            )
+            _set_submodule(layer, target_name, q_module.to(next(layer.parameters()).device))
+            quantized_modules.append(full_name)
 
     if not quantized_modules:
         raise RuntimeError("No decoder linear modules were quantized. Aborting.")
     return {"quantized_modules": quantized_modules, "skipped": skipped_logs}
+
+
+def _prepare_awq_module_scaffold(
+    model: nn.Module,
+    group_size: int,
+    skip_first_n: int,
+    skip_last_n: int,
+    target_name_groups: Tuple[Tuple[str, ...], ...] = TARGET_LINEAR_NAME_GROUPS,
+) -> List[str]:
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("Model does not expose model.layers decoder stack.")
+    layers = model.model.layers
+    total_layers = len(layers)
+    if skip_first_n < 0 or skip_last_n < 0 or (skip_first_n + skip_last_n) >= total_layers:
+        raise ValueError(
+            f"Invalid skip range: total={total_layers}, skip_first={skip_first_n}, skip_last={skip_last_n}"
+        )
+    skip_indices = set(range(skip_first_n)) | set(range(total_layers - skip_last_n, total_layers))
+    module_names: List[str] = []
+    for layer_idx, layer in enumerate(layers):
+        if layer_idx in skip_indices:
+            continue
+        layer_name = f"model.layers.{layer_idx}"
+        for candidates in target_name_groups:
+            target_name = _resolve_target_name(layer, candidates, layer_name)
+            module_name = f"{layer_name}.{target_name}"
+            target = layer.get_submodule(target_name)
+            if hasattr(target, "base_layer"):
+                continue
+            if not isinstance(target, nn.Linear):
+                raise TypeError(f"{module_name}: expected nn.Linear, got {type(target).__name__}")
+            awq_module = AWQInt4LinearW4A16(
+                in_features=target.in_features,
+                out_features=target.out_features,
+                group_size=group_size,
+                has_bias=target.bias is not None,
+            )
+            _set_submodule(layer, target_name, awq_module.to(target.weight.device))
+            module_names.append(module_name)
+    if not module_names:
+        raise RuntimeError("No decoder linear modules were prepared for AWQ delta load.")
+    return module_names
+
+
+def _collect_target_module_names(
+    model: nn.Module,
+    skip_first_n: int,
+    skip_last_n: int,
+    target_name_groups: Tuple[Tuple[str, ...], ...] = TARGET_LINEAR_NAME_GROUPS,
+) -> List[str]:
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("Model does not expose model.layers decoder stack.")
+    layers = model.model.layers
+    total_layers = len(layers)
+    if skip_first_n < 0 or skip_last_n < 0 or (skip_first_n + skip_last_n) >= total_layers:
+        raise ValueError(
+            f"Invalid skip range: total={total_layers}, skip_first={skip_first_n}, skip_last={skip_last_n}"
+        )
+    skip_indices = set(range(skip_first_n)) | set(range(total_layers - skip_last_n, total_layers))
+    names: List[str] = []
+    for layer_idx, layer in enumerate(layers):
+        if layer_idx in skip_indices:
+            continue
+        layer_name = f"model.layers.{layer_idx}"
+        for candidates in target_name_groups:
+            target_name = _resolve_target_name(layer, candidates, layer_name)
+            full_name = f"{layer_name}.{target_name}"
+            target = layer.get_submodule(target_name)
+            if hasattr(target, "base_layer"):
+                continue
+            if not isinstance(target, nn.Linear):
+                raise TypeError(f"{full_name}: expected nn.Linear, got {type(target).__name__}")
+            names.append(full_name)
+    if not names:
+        raise RuntimeError("No target decoder linear modules found for calibration.")
+    return names
 
 
 def apply_awq_delta_to_model(model: nn.Module, delta_path: str, map_location: str = "cpu") -> None:
@@ -357,7 +558,7 @@ def apply_awq_delta_to_model(model: nn.Module, delta_path: str, map_location: st
                 "Please ensure base_model_path points to the same LoRA architecture/checkpoint family "
                 "used during AWQ export."
             )
-    apply_decoder_awq_int4(
+    _prepare_awq_module_scaffold(
         model=model,
         group_size=int(meta["group_size"]),
         skip_first_n=int(meta["skip_first_n"]),
@@ -409,6 +610,51 @@ def _build_argparser() -> argparse.ArgumentParser:
         default="vision",
         help="Adapter name to merge when --merge_lora is enabled.",
     )
+    parser.add_argument("--calib_data", type=str, default="data/DriveLM_nuScenes/split_448/val")
+    parser.add_argument("--calib_samples", type=int, default=256)
+    parser.add_argument("--calib_batch_size", type=int, default=1)
+    parser.add_argument("--calib_num_workers", type=int, default=4)
+    parser.add_argument(
+        "--calib_tag_ref",
+        type=str,
+        default="data/DriveLM_nuScenes/refs/val_cot.json",
+        help="QA tag reference JSON used to build balanced calibration subset.",
+    )
+    parser.add_argument(
+        "--calib_coord_tag",
+        type=int,
+        default=3,
+        help="Coordinate-sensitive tag id to boost during calibration sampling.",
+    )
+    parser.add_argument(
+        "--calib_coord_ratio",
+        type=float,
+        default=0.4,
+        help="Target ratio for coordinate-sensitive tag in calibration subset.",
+    )
+    parser.add_argument("--calib_seed", type=int, default=42)
+    parser.add_argument(
+        "--collate_fn",
+        type=str,
+        default="drivelm_nus_phi4_collate_fn_val",
+        help="Collate function used to build calibration batches.",
+    )
+    parser.add_argument(
+        "--processor",
+        type=str,
+        default=None,
+        help="Tokenizer/processor dir for tokenizer overlay. Defaults to --model if tokenizer exists.",
+    )
+    parser.add_argument(
+        "--processor_base",
+        type=str,
+        default="/root/autodl-tmp/phi-4-multimodal-finetuned/",
+        help="Base processor path used to initialize multimodal processor.",
+    )
+    parser.add_argument("--use_optical_flow", action="store_true")
+    parser.add_argument("--flow_root", type=str, default="")
+    parser.add_argument("--flow_scale_u", type=float, default=8.778)
+    parser.add_argument("--flow_scale_v", type=float, default=2.888)
     parser.add_argument(
         "--layer_report",
         type=str,
@@ -564,6 +810,10 @@ def _copy_base_runtime_files(base_model_dir: str, export_dir: str) -> None:
 def main() -> None:
     args = _build_argparser().parse_args()
     _ensure_parent_dir(args.output)
+    if args.calib_samples <= 0:
+        raise ValueError("--calib_samples must be > 0.")
+    if args.calib_batch_size <= 0:
+        raise ValueError("--calib_batch_size must be > 0.")
 
     print(f"[awq] loading model from: {args.model}")
     try:
@@ -599,9 +849,72 @@ def main() -> None:
     else:
         print("[awq] merge_lora disabled: LoRA wrappers will be skipped during quantization.")
 
+    if not os.path.isdir(args.processor_base):
+        raise FileNotFoundError(f"processor_base directory not found: {args.processor_base}")
+    if args.processor:
+        tokenizer_src = args.processor
+    elif os.path.isfile(os.path.join(args.model, "tokenizer.json")) or os.path.isfile(
+        os.path.join(args.model, "added_tokens.json")
+    ):
+        tokenizer_src = args.model
+    else:
+        tokenizer_src = args.processor_base
+    processor = AutoProcessor.from_pretrained(args.processor_base, trust_remote_code=True)
+    if tokenizer_src != args.processor_base:
+        from transformers import AutoTokenizer
+        processor.tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, trust_remote_code=True)
+
+    collate_fn = build_collate_fn(args.collate_fn)
+    calib_collate = partial(
+        collate_fn,
+        processor=processor,
+        dtype=torch.bfloat16,
+        use_optical_flow=args.use_optical_flow,
+        flow_root=args.flow_root or "",
+        flow_scale_u=args.flow_scale_u,
+        flow_scale_v=args.flow_scale_v,
+    )
+    calib_dataset = load_from_disk(args.calib_data)
+    n = min(args.calib_samples, len(calib_dataset))
+    calib_indices, calib_dist = select_balanced_calibration_indices(
+        dataset=calib_dataset,
+        tag_ref_json=args.calib_tag_ref,
+        calib_samples=n,
+        coord_tag=args.calib_coord_tag,
+        coord_ratio=args.calib_coord_ratio,
+        seed=args.calib_seed,
+    )
+    calib_dataset = Subset(calib_dataset, calib_indices)
+    calib_loader = DataLoader(
+        calib_dataset,
+        batch_size=args.calib_batch_size,
+        collate_fn=calib_collate,
+        num_workers=args.calib_num_workers,
+        shuffle=False,
+    )
+    max_batches = int(math.ceil(n / args.calib_batch_size))
+    target_modules = _collect_target_module_names(
+        model=model,
+        skip_first_n=args.skip_first_n,
+        skip_last_n=args.skip_last_n,
+        target_name_groups=TARGET_LINEAR_NAME_GROUPS,
+    )
+    print(
+        f"[awq] collecting calibration stats on {n} samples, "
+        f"tag_dist={calib_dist}, target_modules={len(target_modules)}"
+    )
+    h_diag_map = collect_hessian_diag(
+        model=model,
+        module_names=target_modules,
+        dataloader=calib_loader,
+        device=args.device,
+        max_batches=max_batches,
+    )
+
     print("[awq] applying int4 quantization on decoder target linear layers ...")
     result = apply_decoder_awq_int4(
         model=model,
+        h_diag_map=h_diag_map,
         group_size=args.group_size,
         skip_first_n=args.skip_first_n,
         skip_last_n=args.skip_last_n,
@@ -614,7 +927,7 @@ def main() -> None:
 
     delta_state = {
         "meta": {
-            "algorithm": "awq_style_int4_weight_only",
+            "algorithm": "awq_style_activation_aware_int4_weight_only",
             "activation_dtype": "float16",
             "weight_bits": 4,
             "group_size": args.group_size,
@@ -626,6 +939,16 @@ def main() -> None:
             "lora_policy": (
                 f"merge_adapter:{args.lora_adapter}" if args.merge_lora else "skip_wrapper"
             ),
+            "calibration": {
+                "calib_data": args.calib_data,
+                "calib_samples": n,
+                "calib_batch_size": args.calib_batch_size,
+                "calib_tag_ref": args.calib_tag_ref,
+                "calib_coord_tag": args.calib_coord_tag,
+                "calib_coord_ratio": args.calib_coord_ratio,
+                "calib_seed": args.calib_seed,
+                "selected_tag_distribution": calib_dist,
+            },
         },
         "quantized_modules": result["quantized_modules"],
         "module_states": module_states,
@@ -669,7 +992,7 @@ def main() -> None:
             "notes": [
                 "Load base model from base_model_path with trust_remote_code=True.",
                 "Call apply_awq_delta_to_model(model, awq_delta_path).",
-                "This package is decoder-weight-only int4 AWQ style; activations stay fp16.",
+                "This package is decoder-weight-only int4 AWQ style with calibration; activations stay fp16.",
             ],
         }
         with open(os.path.join(args.export_dir, "manifest.json"), "w", encoding="utf-8") as f:
