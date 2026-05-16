@@ -29,7 +29,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from datasets import load_from_disk
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -52,7 +51,7 @@ TARGET_LINEAR_NAME_GROUPS: Tuple[Tuple[str, ...], ...] = (
 
 
 class AWQInt4LinearW4A16(nn.Module):
-    """Simple int4 packed linear with on-the-fly dequantization (W4A16)."""
+    """Int4 weight-only linear backed by fused PyTorch int4 GEMM kernel."""
 
     def __init__(
         self,
@@ -92,6 +91,21 @@ class AWQInt4LinearW4A16(nn.Module):
             "zeros",
             torch.zeros((self.out_features, self.groups), dtype=torch.uint8),
             persistent=True,
+        )
+        self.register_buffer(
+            "qweight_fused",
+            torch.empty(0, dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "q_scale_and_zeros",
+            torch.empty(0, dtype=torch.bfloat16),
+            persistent=False,
+        )
+        self.register_buffer(
+            "bias_fused",
+            torch.empty(0, dtype=torch.bfloat16),
+            persistent=False,
         )
 
         if has_bias:
@@ -178,22 +192,39 @@ class AWQInt4LinearW4A16(nn.Module):
         module.zeros = zeros.to(device=linear.weight.device)
         if linear.bias is not None:
             module.bias = linear.bias.detach().to(dtype=torch.float16, device=linear.weight.device)
+        module.rebuild_fused_params()
         return module
 
-    def _dequant_weight(self, dtype: torch.dtype) -> torch.Tensor:
-        q = self._unpack_int4(self.qweight).to(dtype=torch.float32)
-        scales = self.scales.to(dtype=torch.float32)
-        zeros = self.zeros.to(dtype=torch.float32)
-        # Expand [out, groups] -> [out, in_features] by repeating each group.
-        scales_full = scales.repeat_interleave(self.group_size, dim=1)
-        zeros_full = zeros.repeat_interleave(self.group_size, dim=1)
-        w = (q - zeros_full) * scales_full
-        return w.to(dtype=dtype)
+    def rebuild_fused_params(self) -> None:
+        qweight = (((self.qweight & 0x0F) << 4) | ((self.qweight >> 4) & 0x0F)).contiguous()
+        scales = self.scales.transpose(0, 1).to(dtype=torch.bfloat16).contiguous()
+        zeros = self.zeros.transpose(0, 1).to(dtype=torch.bfloat16).contiguous()
+        self.qweight_fused = torch.ops.aten._convert_weight_to_int4pack(qweight, 8)
+        self.q_scale_and_zeros = torch.stack((scales, scales * (8.0 - zeros)), dim=-1).contiguous()
+        if self.bias is not None:
+            self.bias_fused = self.bias.to(dtype=torch.bfloat16).contiguous()
+        else:
+            self.bias_fused = torch.empty(0, dtype=torch.bfloat16, device=self.qweight.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self._dequant_weight(dtype=x.dtype)
-        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
-        return F.linear(x, w, bias)
+        if not x.is_cuda:
+            raise RuntimeError("AWQ fused int4 kernel requires CUDA tensor input.")
+        if x.dtype != torch.bfloat16:
+            raise RuntimeError("AWQ fused int4 kernel requires bf16 activations.")
+        if self.qweight_fused.numel() == 0:
+            self.rebuild_fused_params()
+        x2d = x.reshape(-1, self.in_features)
+        if not x2d.is_contiguous():
+            x2d = x2d.contiguous()
+        out = torch.ops.aten._weight_int4pack_mm(
+            x2d,
+            self.qweight_fused,
+            self.group_size,
+            self.q_scale_and_zeros,
+        )
+        if self.bias_fused.numel() != 0:
+            out = out + self.bias_fused
+        return out.reshape(*x.shape[:-1], self.out_features)
 
 
 def _set_submodule(root: nn.Module, path: str, new_module: nn.Module) -> None:
@@ -351,6 +382,7 @@ def _awq_quantize_with_group_activation(
     q_module.zeros = zeros.to(device=linear.weight.device)
     if linear.bias is not None:
         q_module.bias = linear.bias.detach().to(dtype=torch.float16, device=linear.weight.device)
+    q_module.rebuild_fused_params()
     return q_module
 
 
@@ -569,6 +601,7 @@ def apply_awq_delta_to_model(model: nn.Module, delta_path: str, map_location: st
     for module_name, state in module_states.items():
         module = model.get_submodule(module_name)
         module.load_state_dict(state, strict=True)
+        module.rebuild_fused_params()
 
 
 def _build_argparser() -> argparse.ArgumentParser:

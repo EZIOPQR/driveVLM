@@ -102,9 +102,11 @@ def main() -> None:
         _attn_implementation="flash_attention_2",
         trust_remote_code=True,
     )
+    model.to(args.device)
     apply_gptq_delta_to_model(model, delta_path, map_location="cpu")
-    model.to(args.device).eval()
+    model.eval()
     generation_config = GenerationConfig.from_pretrained(args.processor_base)
+    generation_config.num_logits_to_keep = 1
     profiler = StageProfiler(model, device=args.device) if args.profile else None
 
     collate_fn = build_collate_fn(args.collate_fn)
@@ -138,7 +140,12 @@ def main() -> None:
         inputs, questions, ids = batch
         inputs = inputs.to(args.device)
         input_len = inputs["input_ids"].shape[-1]
-        generated = model.generate(**inputs, max_new_tokens=args.max_new_tokens, generation_config=generation_config)
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+            generation_config=generation_config,
+            num_logits_to_keep=1,
+        )
         generated = generated[:, input_len:]
         total_input_tokens += int(input_len * generated.shape[0])
         total_generated_tokens += int(generated.shape[0] * generated.shape[1])

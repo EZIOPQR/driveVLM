@@ -15,7 +15,7 @@ import os
 import re
 import time
 from functools import partial
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from datasets import load_from_disk
@@ -58,10 +58,16 @@ class StageProfiler:
         self._backbone_call_count = 0
         self._last_vision_ms = 0.0
         self._last_backbone_mem: Tuple[int, int, int] = (0, 0, 0)
+        self._current_backbone_stage = "prefill"
         self.stats: Dict[str, Dict[str, float]] = {
             "vision_tower": self._empty_stage(),
             "prefill": self._empty_stage(),
             "decode": self._empty_stage(),
+        }
+        self._part_active: Dict[str, List[float]] = {}
+        self.backbone_parts: Dict[str, Dict[str, Dict[str, float]]] = {
+            "prefill": self._empty_backbone_parts(),
+            "decode": self._empty_backbone_parts(),
         }
 
         vision_tower = model.model.embed_tokens_extend.image_embed
@@ -70,6 +76,7 @@ class StageProfiler:
         self._hooks.append(vision_tower.register_forward_hook(self._vision_post))
         self._hooks.append(backbone.register_forward_pre_hook(self._backbone_pre))
         self._hooks.append(backbone.register_forward_hook(self._backbone_post))
+        self._register_backbone_part_hooks(model)
 
     @staticmethod
     def _empty_stage() -> Dict[str, float]:
@@ -79,6 +86,16 @@ class StageProfiler:
             "max_allocated_bytes": 0.0,
             "max_reserved_bytes": 0.0,
             "max_active_delta_allocated_bytes": 0.0,
+        }
+
+    @staticmethod
+    def _empty_backbone_parts() -> Dict[str, Dict[str, float]]:
+        return {
+            "qkv": {"total_ms": 0.0, "calls": 0.0},
+            "attention_total": {"total_ms": 0.0, "calls": 0.0},
+            "wo": {"total_ms": 0.0, "calls": 0.0},
+            "ffn_gate_up": {"total_ms": 0.0, "calls": 0.0},
+            "ffn_down": {"total_ms": 0.0, "calls": 0.0},
         }
 
     def _cuda_sync(self) -> None:
@@ -121,6 +138,53 @@ class StageProfiler:
             float(delta_alloc),
         )
 
+    def _record_backbone_part(self, stage_name: str, part_name: str, elapsed_ms: float) -> None:
+        item = self.backbone_parts[stage_name][part_name]
+        item["total_ms"] += max(0.0, elapsed_ms)
+        item["calls"] += 1.0
+
+    @staticmethod
+    def _resolve_submodule(parent: torch.nn.Module, candidates: List[str]) -> Optional[torch.nn.Module]:
+        for name in candidates:
+            if hasattr(parent, name):
+                return getattr(parent, name)
+        return None
+
+    def _register_part_hook(self, module: Optional[torch.nn.Module], part_name: str) -> None:
+        if module is None:
+            return
+
+        def _pre(_module, _inputs, part=part_name):
+            self._cuda_sync()
+            self._part_active.setdefault(part, []).append(time.perf_counter())
+
+        def _post(_module, _inputs, _output, part=part_name):
+            stack = self._part_active.get(part)
+            if not stack:
+                return
+            start = stack.pop()
+            self._cuda_sync()
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            self._record_backbone_part(self._current_backbone_stage, part, elapsed_ms)
+
+        self._hooks.append(module.register_forward_pre_hook(_pre))
+        self._hooks.append(module.register_forward_hook(_post))
+
+    def _register_backbone_part_hooks(self, model: torch.nn.Module) -> None:
+        layers = getattr(getattr(model, "model", None), "layers", None)
+        if layers is None:
+            return
+        for layer in layers:
+            attn = self._resolve_submodule(layer, ["self_attn", "attention"])
+            self._register_part_hook(attn, "attention_total")
+            if attn is not None:
+                self._register_part_hook(self._resolve_submodule(attn, ["qkv_proj", "wqkv"]), "qkv")
+                self._register_part_hook(self._resolve_submodule(attn, ["o_proj", "wo"]), "wo")
+            mlp = self._resolve_submodule(layer, ["mlp", "feed_forward"])
+            if mlp is not None:
+                self._register_part_hook(self._resolve_submodule(mlp, ["gate_up_proj", "w1w3"]), "ffn_gate_up")
+                self._register_part_hook(self._resolve_submodule(mlp, ["down_proj", "w2"]), "ffn_down")
+
     def _vision_pre(self, module, inputs) -> None:
         self._stage_start("vision")
 
@@ -130,6 +194,7 @@ class StageProfiler:
         self._record_stage("vision_tower", elapsed_ms, peak_alloc, reserved, delta_alloc)
 
     def _backbone_pre(self, module, inputs) -> None:
+        self._current_backbone_stage = "prefill" if self._backbone_call_count == 0 else "decode"
         self._stage_start("backbone")
 
     def _backbone_post(self, module, inputs, output) -> None:
@@ -167,7 +232,48 @@ class StageProfiler:
                 "max_reserved_bytes": int(stage["max_reserved_bytes"]),
                 "max_active_delta_allocated_bytes": int(stage["max_active_delta_allocated_bytes"]),
             }
+        out["backbone_parts"] = self._summarize_backbone_parts()
         return out
+
+    def _summarize_backbone_parts(self) -> Dict[str, Dict[str, Dict[str, float]]]:
+        summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+        total_backbone_ms = self.stats["prefill"]["total_ms"] + self.stats["decode"]["total_ms"]
+        for stage_name in ("prefill", "decode"):
+            stage_total_ms = self.stats[stage_name]["total_ms"]
+            part_items: Dict[str, Dict[str, float]] = {}
+            for part_name, item in self.backbone_parts[stage_name].items():
+                part_total = item["total_ms"]
+                calls = int(item["calls"])
+                part_items[part_name] = {
+                    "total_ms": part_total,
+                    "calls": calls,
+                    "avg_ms": (part_total / max(1, calls)),
+                    "share_of_stage_backbone": (part_total / stage_total_ms if stage_total_ms > 0 else 0.0),
+                }
+            attn_core_ms = max(
+                0.0,
+                part_items["attention_total"]["total_ms"] - part_items["qkv"]["total_ms"] - part_items["wo"]["total_ms"],
+            )
+            ffn_total_ms = part_items["ffn_gate_up"]["total_ms"] + part_items["ffn_down"]["total_ms"]
+            part_items["attention_core"] = {
+                "total_ms": attn_core_ms,
+                "calls": part_items["attention_total"]["calls"],
+                "avg_ms": attn_core_ms / max(1, part_items["attention_total"]["calls"]),
+                "share_of_stage_backbone": (attn_core_ms / stage_total_ms if stage_total_ms > 0 else 0.0),
+            }
+            part_items["ffn_total"] = {
+                "total_ms": ffn_total_ms,
+                "calls": min(part_items["ffn_gate_up"]["calls"], part_items["ffn_down"]["calls"]),
+                "avg_ms": ffn_total_ms / max(1, min(part_items["ffn_gate_up"]["calls"], part_items["ffn_down"]["calls"])),
+                "share_of_stage_backbone": (ffn_total_ms / stage_total_ms if stage_total_ms > 0 else 0.0),
+            }
+            summary[stage_name] = part_items
+        summary["total"] = {
+            "backbone_total_ms": total_backbone_ms,
+            "prefill_share": (self.stats["prefill"]["total_ms"] / total_backbone_ms if total_backbone_ms > 0 else 0.0),
+            "decode_share": (self.stats["decode"]["total_ms"] / total_backbone_ms if total_backbone_ms > 0 else 0.0),
+        }
+        return summary
 
     def close(self) -> None:
         for h in self._hooks:

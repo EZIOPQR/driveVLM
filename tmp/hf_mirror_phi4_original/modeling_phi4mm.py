@@ -2168,7 +2168,7 @@ class Phi4MMForCausalLM(Phi4MMPreTrainedModel, GenerationMixin):
         cache_position=None,
         position_ids=None,
         use_cache=True,
-        num_logits_to_keep=None,
+        num_logits_to_keep: int = 0,
         **kwargs
     ):
         # Overwritten -- this model may need to switch between short and long rope, invalidating the cache in the

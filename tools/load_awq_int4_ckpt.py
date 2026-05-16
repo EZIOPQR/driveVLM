@@ -70,8 +70,8 @@ def main() -> None:
         torch_dtype=dtype,
         _attn_implementation="flash_attention_2",
     )
-    apply_awq_delta_to_model(model, delta_path, map_location="cpu")
     model.to(args.device)
+    apply_awq_delta_to_model(model, delta_path, map_location="cpu")
     model.eval()
 
     print("[awq-load] model loaded and delta applied.")

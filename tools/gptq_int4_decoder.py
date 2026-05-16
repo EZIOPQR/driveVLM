@@ -219,6 +219,7 @@ def _gptq_quantize_linear_diag(
     q_module.zeros = zeros.to(device=linear.weight.device)
     if linear.bias is not None:
         q_module.bias = linear.bias.detach().to(dtype=torch.float16, device=linear.weight.device)
+    q_module.rebuild_fused_params()
     return q_module
 
 
@@ -323,6 +324,7 @@ def apply_gptq_delta_to_model(model: nn.Module, delta_path: str, map_location: s
             _set_submodule(model, module_name, q_module.to(module.weight.device))
             module = model.get_submodule(module_name)
         module.load_state_dict(module_states[module_name], strict=True)
+        module.rebuild_fused_params()
 
 
 def _build_argparser() -> argparse.ArgumentParser:

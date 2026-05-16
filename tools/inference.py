@@ -196,6 +196,7 @@ def main(args):
     model.to(args.device)
     model.eval()
     generation_config = GenerationConfig.from_pretrained(base_model)
+    generation_config.num_logits_to_keep = 1
 
     profiler = LatencyProfiler(model, device=args.device) if args.profile else None
 
@@ -228,7 +229,8 @@ def main(args):
         output = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
-            generation_config=generation_config
+            generation_config=generation_config,
+            num_logits_to_keep=1,
         )
         output = output[:, input_len:]
         results = processor.batch_decode(output, skip_special_tokens=False)

@@ -57,8 +57,8 @@ def main() -> None:
         torch_dtype=_to_dtype(args.dtype),
         _attn_implementation="flash_attention_2",
     )
-    apply_gptq_delta_to_model(model, delta_path, map_location="cpu")
     model.to(args.device)
+    apply_gptq_delta_to_model(model, delta_path, map_location="cpu")
     model.eval()
 
     print("[gptq-load] model loaded and delta applied.")
