@@ -28,6 +28,7 @@ from drivevlms.build import build_collate_fn
 
 _LOC_RE = re.compile(r"<loc_(\d+)>")
 _CTRL_TOKEN_RE = re.compile(r"<\|[^|>]+\|>")
+_IMAGE_SPECIAL_TOKEN_ID = 200010
 
 
 def _postprocess_generated(text: str, stride: int = 4) -> str:
@@ -45,6 +46,43 @@ def _gpu_name(device: str, cuda_enabled: bool) -> str:
     else:
         idx = torch.cuda.current_device()
     return torch.cuda.get_device_name(idx)
+
+
+def _compress_image_special_tokens(
+    inputs: Dict[str, torch.Tensor],
+    keep_ratio: float,
+    image_token_id: int,
+    pad_token_id: int,
+) -> Dict[str, torch.Tensor]:
+    if keep_ratio >= 1.0:
+        return inputs
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    batch_size = input_ids.shape[0]
+    kept_ids: List[torch.Tensor] = []
+    max_len = 0
+    for b in range(batch_size):
+        valid = attention_mask[b].bool()
+        seq_ids = input_ids[b][valid]
+        image_pos = torch.nonzero(seq_ids == image_token_id, as_tuple=False).squeeze(-1)
+        if image_pos.numel() == 0:
+            seq_keep = seq_ids
+        else:
+            keep_n = max(1, int(round(float(image_pos.numel()) * keep_ratio)))
+            keep_mask = torch.ones_like(seq_ids, dtype=torch.bool)
+            keep_mask[image_pos[keep_n:]] = False
+            seq_keep = seq_ids[keep_mask]
+        kept_ids.append(seq_keep)
+        max_len = max(max_len, int(seq_keep.numel()))
+    new_input_ids = input_ids.new_full((batch_size, max_len), pad_token_id)
+    new_attention_mask = attention_mask.new_zeros((batch_size, max_len))
+    for b, seq in enumerate(kept_ids):
+        seq_len = int(seq.numel())
+        new_input_ids[b, -seq_len:] = seq
+        new_attention_mask[b, -seq_len:] = 1
+    inputs["input_ids"] = new_input_ids
+    inputs["attention_mask"] = new_attention_mask
+    return inputs
 
 
 class StageProfiler:
@@ -322,6 +360,13 @@ def main(args):
     )
     model.to(args.device)
     model.eval()
+    image_embed = model.model.embed_tokens_extend.image_embed
+    if hasattr(image_embed, "configure_token_pruning"):
+        image_embed.configure_token_pruning(
+            enabled=args.vision_token_prune,
+            keep_ratio=args.vision_token_keep_ratio,
+            layer_idx=args.vision_token_prune_layer_idx,
+        )
     generation_config = GenerationConfig.from_pretrained(BASE)
     profiler = StageProfiler(model, device=args.device) if args.profile else None
 
@@ -360,6 +405,13 @@ def main(args):
     for batch in tqdm(dataloader):
         inputs, questions, ids = batch
         inputs = inputs.to(args.device)
+        if args.vision_token_prune:
+            inputs = _compress_image_special_tokens(
+                inputs=inputs,
+                keep_ratio=args.vision_token_keep_ratio,
+                image_token_id=_IMAGE_SPECIAL_TOKEN_ID,
+                pad_token_id=processor.tokenizer.pad_token_id or 0,
+            )
         input_len = inputs["input_ids"].shape[-1]
         output = model.generate(
             **inputs,
@@ -489,6 +541,24 @@ def parse_args():
         help="Normalization divisor for flow v channel.",
     )
     parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--vision_token_prune",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable attention-guided token merging in vision tower and compress image placeholders.",
+    )
+    parser.add_argument(
+        "--vision_token_keep_ratio",
+        type=float,
+        default=0.35,
+        help="Fraction of vision tokens to keep (typically 0.2~0.5).",
+    )
+    parser.add_argument(
+        "--vision_token_prune_layer_idx",
+        type=int,
+        default=-2,
+        help="Vision layer index used for attention-guided token importance.",
+    )
     parser.add_argument(
         "--profile_output",
         type=str,
